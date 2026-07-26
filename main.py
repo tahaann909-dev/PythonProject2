@@ -512,6 +512,15 @@ CREATE TABLE IF NOT EXISTS sticky (
     last_id     INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS rules (
+    guild_id    INTEGER PRIMARY KEY,
+    channel_id  INTEGER,
+    message_id  INTEGER,
+    role_id     INTEGER,
+    content     TEXT,
+    accepted    INTEGER DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS hardbans (
     guild_id    INTEGER NOT NULL,
     user_id     INTEGER NOT NULL,
@@ -606,6 +615,10 @@ class Database:
             "guild_settings": {
                 "jail_role": "INTEGER",
                 "jail_channel": "INTEGER",
+            },
+            "welcome": {
+                "welcome_image": "TEXT",
+                "goodbye_image": "TEXT",
             },
         }
         for table, columns in wanted.items():
@@ -831,6 +844,22 @@ class Database:
     async def claim_ticket(self, channel_id, mod_id):
         await self.execute(
             "UPDATE tickets SET claimed_by=? WHERE channel_id=?", (mod_id, channel_id)
+        )
+
+    # ------------------------------------------------------------ règlement
+    async def rules(self, guild_id):
+        await self._ensure_row("rules", guild_id)
+        return await self.fetchone("SELECT * FROM rules WHERE guild_id=?", (guild_id,))
+
+    async def set_rules(self, guild_id, key, value):
+        await self._ensure_row("rules", guild_id)
+        await self.execute(
+            f"UPDATE rules SET {key}=? WHERE guild_id=?", (value, guild_id)
+        )
+
+    async def bump_rules_accepted(self, guild_id):
+        await self.execute(
+            "UPDATE rules SET accepted=accepted+1 WHERE guild_id=?", (guild_id,)
         )
 
     # ------------------------------------------------------------ hardban
@@ -3097,7 +3126,7 @@ class Welcome(commands.Cog):
             .replace("{joined}", h.ts(joined))
         )
 
-    def welcome_embed(self, member, text) -> discord.Embed:
+    def welcome_embed(self, member, text, image_url=None) -> discord.Embed:
         e = h.base_embed(
             f"{config.EMOJI['wave']} Bienvenue !", text, config.COLOR_SUCCESS
         )
@@ -3112,6 +3141,11 @@ class Welcome(commands.Cog):
             value=f"#{member.guild.member_count}",
             inline=True,
         )
+        # Bannière animée : GIF/image configurée, sinon la bannière du serveur.
+        if image_url:
+            e.set_image(url=image_url)
+        elif member.guild.banner:
+            e.set_image(url=member.guild.banner.url)
         e.set_footer(text=str(member), icon_url=member.display_avatar.url)
         return e
 
@@ -3139,7 +3173,7 @@ class Welcome(commands.Cog):
                 try:
                     await channel.send(
                         content=member.mention,
-                        embed=self.welcome_embed(member, text),
+                        embed=self.welcome_embed(member, text, cfg["welcome_image"]),
                         allowed_mentions=discord.AllowedMentions(users=True),
                     )
                 except discord.HTTPException:
@@ -3167,6 +3201,10 @@ class Welcome(commands.Cog):
         text = self.render(cfg["goodbye_message"], member)
         e = h.base_embed("Un membre est parti", text, config.COLOR_MUTED)
         e.set_thumbnail(url=member.display_avatar.url)
+        if cfg["goodbye_image"]:
+            e.set_image(url=cfg["goodbye_image"])
+        elif member.guild.banner:
+            e.set_image(url=member.guild.banner.url)
         if member.joined_at:
             stayed = h.now() - int(member.joined_at.timestamp())
             e.add_field(name="Temps passé sur le serveur", value=h.human_duration(stayed))
@@ -3206,6 +3244,53 @@ class Welcome(commands.Cog):
         )
         e.set_footer(text=f"{ctx.prefix}welcome placeholders · {ctx.prefix}welcome test")
         await ctx.reply(embed=e, mention_author=False)
+
+    @welcome.command(name="config", aliases=["setup", "set"])
+    @h.is_owner_or(manage_guild=True)
+    async def welcome_config(self, ctx, *, image_url: str = None):
+        """
+        Active la bienvenue dans le salon courant, avec un message FR par défaut
+        et une bannière animée. Joins un GIF au message, colle une URL, ou laisse
+        vide pour garder la bannière du serveur.
+        """
+        message_fr = (
+            "Bienvenue {mention} sur **{server}** ! \U0001f389\n"
+            "Tu es notre **{ordinal}** membre. Pense à lire le règlement et "
+            "amuse-toi bien parmi nous."
+        )
+        # Priorité : pièce jointe > URL fournie > rien (bannière du serveur)
+        image = None
+        if ctx.message.attachments:
+            image = ctx.message.attachments[0].url
+        elif image_url:
+            image = image_url.strip("<>")
+
+        await self.bot.db.set_welcome(ctx.guild.id, "welcome_channel", ctx.channel.id)
+        await self.bot.db.set_welcome(ctx.guild.id, "welcome_message", message_fr)
+        if image:
+            await self.bot.db.set_welcome(ctx.guild.id, "welcome_image", image)
+
+        cfg = await self.bot.db.welcome(ctx.guild.id)
+        apercu = self.welcome_embed(ctx.author, self.render(message_fr, ctx.author),
+                                    cfg["welcome_image"])
+        await ctx.send(
+            embed=h.ok_embed(f"Bienvenue configurée dans {ctx.channel.mention}. Aperçu :")
+        )
+        await ctx.send(embed=apercu)
+
+    @welcome.command(name="image", aliases=["banner", "gif"])
+    @h.is_owner_or(manage_guild=True)
+    async def welcome_image_cmd(self, ctx, *, url: str = None):
+        image = None
+        if ctx.message.attachments:
+            image = ctx.message.attachments[0].url
+        elif url:
+            image = url.strip("<>")
+        await self.bot.db.set_welcome(ctx.guild.id, "welcome_image", image)
+        if image:
+            await ctx.reply(embed=h.ok_embed("Bannière de bienvenue mise à jour."))
+        else:
+            await ctx.reply(embed=h.ok_embed("Bannière retirée (retour à celle du serveur)."))
 
     @welcome.command(name="channel")
     @h.is_owner_or(manage_guild=True)
@@ -3270,6 +3355,49 @@ class Welcome(commands.Cog):
     @h.is_owner_or(manage_guild=True)
     async def goodbye(self, ctx):
         await ctx.invoke(self.welcome)
+
+    @goodbye.command(name="config", aliases=["setup", "set"])
+    @h.is_owner_or(manage_guild=True)
+    async def goodbye_config(self, ctx, *, image_url: str = None):
+        """Active les au revoir dans le salon courant, message FR + image."""
+        message_fr = (
+            "**{user}** vient de quitter **{server}**. \U0001f44b\n"
+            "Nous sommes maintenant **{count}** membres."
+        )
+        image = None
+        if ctx.message.attachments:
+            image = ctx.message.attachments[0].url
+        elif image_url:
+            image = image_url.strip("<>")
+
+        await self.bot.db.set_welcome(ctx.guild.id, "goodbye_channel", ctx.channel.id)
+        await self.bot.db.set_welcome(ctx.guild.id, "goodbye_message", message_fr)
+        if image:
+            await self.bot.db.set_welcome(ctx.guild.id, "goodbye_image", image)
+
+        cfg = await self.bot.db.welcome(ctx.guild.id)
+        e = h.base_embed("Un membre est parti",
+                         self.render(message_fr, ctx.author), config.COLOR_MUTED)
+        e.set_thumbnail(url=ctx.author.display_avatar.url)
+        if cfg["goodbye_image"]:
+            e.set_image(url=cfg["goodbye_image"])
+        elif ctx.guild.banner:
+            e.set_image(url=ctx.guild.banner.url)
+        await ctx.send(
+            embed=h.ok_embed(f"Au revoir configurés dans {ctx.channel.mention}. Aperçu :")
+        )
+        await ctx.send(embed=e)
+
+    @goodbye.command(name="image", aliases=["banner", "gif"])
+    @h.is_owner_or(manage_guild=True)
+    async def goodbye_image_cmd(self, ctx, *, url: str = None):
+        image = None
+        if ctx.message.attachments:
+            image = ctx.message.attachments[0].url
+        elif url:
+            image = url.strip("<>")
+        await self.bot.db.set_welcome(ctx.guild.id, "goodbye_image", image)
+        await ctx.reply(embed=h.ok_embed("Image des départs mise à jour."))
 
     @goodbye.command(name="channel")
     @h.is_owner_or(manage_guild=True)
@@ -5636,7 +5764,149 @@ class HardBan(commands.Cog):
 
 
 # ==============================================================================
-#  SECTION 14 - OUTILS (afk, tags, concours...)
+#  SECTION 14 - RÈGLEMENT (bouton -> rôle membre)
+# ==============================================================================
+
+
+
+
+DEFAULT_RULES = (
+    "**1.** Respecte tout le monde. Pas d'insultes, de harcèlement ni de haine.\n"
+    "**2.** Pas de spam, de publicité ni de liens non sollicités.\n"
+    "**3.** Pas de contenu NSFW, choquant ou illégal.\n"
+    "**4.** Utilise les salons pour leur usage prévu.\n"
+    "**5.** Les décisions du staff sont finales.\n\n"
+    "En cliquant sur le bouton ci-dessous, tu confirmes avoir lu et accepté "
+    "ce règlement."
+)
+
+
+class RulesView(discord.ui.View):
+    """Bouton d'acceptation persistant."""
+
+    def __init__(self, bot=None):
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    @discord.ui.button(label="J'accepte le règlement", emoji="\u2705",
+                       style=discord.ButtonStyle.success, custom_id="rules:accept")
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        bot = interaction.client
+        row = await bot.db.rules(interaction.guild.id)
+        if not row or not row["role_id"]:
+            return await interaction.response.send_message(
+                embed=h.err_embed("Aucun rôle de membre n'est configuré. Préviens le staff."),
+                ephemeral=True,
+            )
+        role = interaction.guild.get_role(row["role_id"])
+        if role is None:
+            return await interaction.response.send_message(
+                embed=h.err_embed("Le rôle configuré n'existe plus."), ephemeral=True
+            )
+        if role in interaction.user.roles:
+            return await interaction.response.send_message(
+                embed=h.base_embed(description="Tu as déjà accepté le règlement."),
+                ephemeral=True,
+            )
+        if role >= interaction.guild.me.top_role:
+            return await interaction.response.send_message(
+                embed=h.err_embed("Je ne peux pas attribuer ce rôle (il est au-dessus du mien). "
+                                  "Préviens le staff."),
+                ephemeral=True,
+            )
+        try:
+            await interaction.user.add_roles(role, reason="Règlement accepté")
+        except discord.HTTPException:
+            return await interaction.response.send_message(
+                embed=h.err_embed("Échec de l'attribution du rôle. Préviens le staff."),
+                ephemeral=True,
+            )
+        await bot.db.bump_rules_accepted(interaction.guild.id)
+        await interaction.response.send_message(
+            embed=h.ok_embed(
+                f"Bienvenue ! Tu as reçu le rôle {role.mention} et accès au serveur."
+            ),
+            ephemeral=True,
+        )
+
+
+class Rules(commands.Cog):
+    """Message de règlement avec attribution de rôle."""
+
+    def __init__(self, bot):
+        self.bot = bot
+
+    @commands.group(name="rules", aliases=["reglement", "règlement"],
+                    invoke_without_command=True,
+                    help="Publie le règlement avec bouton d'acceptation.")
+    @commands.guild_only()
+    @h.is_owner_or(manage_guild=True)
+    async def rules(self, ctx):
+        row = await self.bot.db.rules(ctx.guild.id)
+        if not row or not row["role_id"]:
+            return await ctx.reply(
+                embed=h.warn_embed(
+                    f"Configure d'abord le rôle attribué :\n"
+                    f"`{ctx.prefix}rules config @Membre`"
+                )
+            )
+        role = ctx.guild.get_role(row["role_id"])
+        texte = row["content"] or DEFAULT_RULES
+        e = h.base_embed(f"\U0001f4dc Règlement — {ctx.guild.name}", texte)
+        if ctx.guild.icon:
+            e.set_thumbnail(url=ctx.guild.icon.url)
+        e.set_footer(text="Clique sur le bouton pour accepter et débloquer le serveur.")
+        msg = await ctx.send(embed=e, view=RulesView(self.bot))
+        await self.bot.db.set_rules(ctx.guild.id, "channel_id", ctx.channel.id)
+        await self.bot.db.set_rules(ctx.guild.id, "message_id", msg.id)
+
+    @rules.command(name="config", aliases=["setup", "set"])
+    @h.is_owner_or(manage_guild=True)
+    async def rules_config(self, ctx, role: discord.Role, *, texte: str = None):
+        if role >= ctx.guild.me.top_role:
+            return await ctx.reply(
+                embed=h.err_embed(
+                    "Ce rôle est au-dessus du mien — je ne pourrai pas l'attribuer. "
+                    "Monte mon rôle au-dessus dans les paramètres du serveur."
+                )
+            )
+        await self.bot.db.set_rules(ctx.guild.id, "role_id", role.id)
+        if texte:
+            await self.bot.db.set_rules(ctx.guild.id, "content", texte[:4000])
+        await ctx.reply(
+            embed=h.ok_embed(
+                f"Rôle d'accès réglé sur {role.mention}."
+                + ("" if texte else f"\nRèglement par défaut utilisé — personnalise-le "
+                                    f"avec `{ctx.prefix}rules text <ton texte>`.")
+                + f"\nPublie le message avec `{ctx.prefix}rules`."
+            )
+        )
+
+    @rules.command(name="text", aliases=["texte", "message"])
+    @h.is_owner_or(manage_guild=True)
+    async def rules_text(self, ctx, *, texte: str):
+        await self.bot.db.set_rules(ctx.guild.id, "content", texte[:4000])
+        await ctx.reply(
+            embed=h.ok_embed(f"Texte du règlement enregistré. Publie-le avec "
+                             f"`{ctx.prefix}rules`.")
+        )
+
+    @rules.command(name="stats")
+    @h.is_owner_or(manage_guild=True)
+    async def rules_stats(self, ctx):
+        row = await self.bot.db.rules(ctx.guild.id)
+        role = ctx.guild.get_role(row["role_id"]) if row and row["role_id"] else None
+        await ctx.reply(
+            embed=h.base_embed(
+                "Règlement",
+                f"**Rôle d'accès :** {role.mention if role else '*non configuré*'}\n"
+                f"**Acceptations :** {row['accepted'] if row else 0}",
+            )
+        )
+
+
+# ==============================================================================
+#  SECTION 15 - OUTILS (afk, tags, concours...)
 # ==============================================================================
 
 
@@ -6230,7 +6500,7 @@ class Tools(commands.Cog):
 
 
 # ==============================================================================
-#  SECTION 15 - PANNEAU DE COMMANDES
+#  SECTION 16 - PANNEAU DE COMMANDES
 # ==============================================================================
 
 
@@ -6399,7 +6669,7 @@ class Panel(commands.Cog):
 
 
 # ==============================================================================
-#  SECTION 16 - SALONS VOCAUX TEMPORAIRES
+#  SECTION 17 - SALONS VOCAUX TEMPORAIRES
 # ==============================================================================
 
 
@@ -6975,7 +7245,7 @@ class TempVoice(commands.Cog):
 
 
 # ==============================================================================
-#  SECTION 17 - SCHEDULER (temp punishment expiry)
+#  SECTION 18 - SCHEDULER (temp punishment expiry)
 # ==============================================================================
 
 
@@ -7130,7 +7400,7 @@ class Scheduler(commands.Cog):
 
 
 # ==============================================================================
-#  SECTION 18 - HELP & UTILITY
+#  SECTION 19 - HELP & UTILITY
 # ==============================================================================
 
 
@@ -7435,7 +7705,7 @@ class Utility(commands.Cog):
 
 
 # ==============================================================================
-#  SECTION 19 - BOT CLASS & ENTRY POINT
+#  SECTION 20 - BOT CLASS & ENTRY POINT
 # ==============================================================================
 
 
@@ -7533,7 +7803,7 @@ class MyBot(commands.Bot):
         log.info("Database ready at %s", config.DB_PATH)
 
         for cog in (Moderation, AntiRaid, Tickets, Welcome,
-                    Stats, Fun, OpMod, Tools, VoiceStats, Extras, HardBan, Panel, TempVoice, Scheduler, Utility):
+                    Stats, Fun, OpMod, Tools, VoiceStats, Extras, HardBan, Rules, Panel, TempVoice, Scheduler, Utility):
             try:
                 await self.add_cog(cog(self))
                 log.info("Loaded %s", cog.__name__)
@@ -7547,6 +7817,7 @@ class MyBot(commands.Bot):
             self.add_view(TicketControlView(self))
             self.add_view(VoicePanelView(self))
             self.add_view(PanelView(self))
+            self.add_view(RulesView(self))
             self.persistent_views_added = True
 
     async def close(self):
