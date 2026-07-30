@@ -512,6 +512,23 @@ CREATE TABLE IF NOT EXISTS sticky (
     last_id     INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS stat_channels (
+    guild_id    INTEGER NOT NULL,
+    channel_id  INTEGER NOT NULL,
+    kind        TEXT NOT NULL,      -- members|online|voice|bots|boosts|humans
+    template    TEXT,               -- ex: "\U0001f465 • Membres : {count}"
+    PRIMARY KEY (channel_id)
+);
+
+CREATE TABLE IF NOT EXISTS log_config (
+    guild_id        INTEGER PRIMARY KEY,
+    log_text        INTEGER,        -- messages supprimés / édités
+    log_mod         INTEGER,        -- bans / kicks / mutes / rôles
+    log_voice       INTEGER,        -- arrivées / départs / déplacements vocaux
+    log_join        INTEGER,        -- arrivées / départs de membres
+    enabled         INTEGER DEFAULT 1
+);
+
 CREATE TABLE IF NOT EXISTS rules (
     guild_id    INTEGER PRIMARY KEY,
     channel_id  INTEGER,
@@ -844,6 +861,38 @@ class Database:
     async def claim_ticket(self, channel_id, mod_id):
         await self.execute(
             "UPDATE tickets SET claimed_by=? WHERE channel_id=?", (mod_id, channel_id)
+        )
+
+    # ------------------------------------------------------------ salons compteurs
+    async def add_stat_channel(self, guild_id, channel_id, kind, template):
+        await self.execute(
+            "INSERT OR REPLACE INTO stat_channels (guild_id,channel_id,kind,template)"
+            " VALUES (?,?,?,?)",
+            (guild_id, channel_id, kind, template),
+        )
+
+    async def stat_channels(self, guild_id):
+        return await self.fetchall(
+            "SELECT * FROM stat_channels WHERE guild_id=?", (guild_id,)
+        )
+
+    async def all_stat_channels(self):
+        return await self.fetchall("SELECT * FROM stat_channels")
+
+    async def remove_stat_channel(self, channel_id):
+        await self.execute(
+            "DELETE FROM stat_channels WHERE channel_id=?", (channel_id,)
+        )
+
+    # ------------------------------------------------------------ logs
+    async def log_config(self, guild_id):
+        await self._ensure_row("log_config", guild_id)
+        return await self.fetchone("SELECT * FROM log_config WHERE guild_id=?", (guild_id,))
+
+    async def set_log(self, guild_id, key, value):
+        await self._ensure_row("log_config", guild_id)
+        await self.execute(
+            f"UPDATE log_config SET {key}=? WHERE guild_id=?", (value, guild_id)
         )
 
     # ------------------------------------------------------------ règlement
@@ -4906,14 +4955,60 @@ class VoiceStats(commands.Cog):
 
     # ================================================================ vocal courtes
 
-    @commands.command(name="vckick", help="Déconnecte un membre du vocal.")
+    @commands.command(name="move", help="-move <@user|ID> [salon] — déplace en vocal.")
     @commands.guild_only()
     @h.is_owner_or(move_members=True)
-    async def vckick(self, ctx, membre: discord.Member, *, reason: str = ""):
-        if not membre.voice:
+    async def move(self, ctx, cible: str, *, salon: discord.VoiceChannel = None):
+        uid = cible.strip("<@!>")
+        if not uid.isdigit():
+            return await ctx.reply(embed=h.err_embed("Donne une mention ou un ID valide."))
+        membre = ctx.guild.get_member(int(uid))
+        if membre is None:
+            return await ctx.reply(embed=h.err_embed("Membre introuvable."))
+        if membre.voice is None:
             return await ctx.reply(embed=h.err_embed("Ce membre n'est pas en vocal."))
-        await membre.move_to(None, reason=f"{ctx.author}: {reason}")
-        await ctx.reply(embed=h.ok_embed(f"**{membre}** déconnecté."))
+        # Sans salon indiqué : on l'amène dans le tien.
+        if salon is None:
+            if ctx.author.voice is None:
+                return await ctx.reply(
+                    embed=h.err_embed("Indique un salon, ou sois toi-même en vocal.")
+                )
+            salon = ctx.author.voice.channel
+        await membre.move_to(salon, reason=f"Déplacé par {ctx.author}")
+        await ctx.reply(embed=h.ok_embed(f"**{membre}** déplacé vers {salon.mention}."))
+
+    @commands.command(name="setrole", help="-setrole <@user|ID> <nom du rôle> — donne un rôle par son nom.")
+    @commands.guild_only()
+    @h.is_owner_or(manage_roles=True)
+    @commands.bot_has_permissions(manage_roles=True)
+    async def setrole(self, ctx, cible: str, *, nom_role: str):
+        uid = cible.strip("<@!>")
+        if not uid.isdigit():
+            return await ctx.reply(embed=h.err_embed("Donne une mention ou un ID valide."))
+        membre = ctx.guild.get_member(int(uid))
+        if membre is None:
+            return await ctx.reply(embed=h.err_embed("Membre introuvable."))
+        role = discord.utils.find(
+            lambda r: r.name.lower() == nom_role.lower(), ctx.guild.roles
+        )
+        if role is None:
+            role = discord.utils.find(
+                lambda r: nom_role.lower() in r.name.lower(), ctx.guild.roles
+            )
+        if role is None:
+            return await ctx.reply(
+                embed=h.err_embed(f"Aucun rôle nommé « {h.clean(nom_role, 50)} ».")
+            )
+        if role >= ctx.guild.me.top_role:
+            return await ctx.reply(embed=h.err_embed("Ce rôle est au-dessus du mien."))
+        if role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+            return await ctx.reply(embed=h.err_embed("Ce rôle est au-dessus du tien."))
+        if role in membre.roles:
+            await membre.remove_roles(role, reason=f"Par {ctx.author}")
+            await ctx.reply(embed=h.ok_embed(f"{role.mention} retiré à {membre.mention}."))
+        else:
+            await membre.add_roles(role, reason=f"Par {ctx.author}")
+            await ctx.reply(embed=h.ok_embed(f"{role.mention} donné à {membre.mention}."))
 
     @commands.command(name="vcmove", help="-vcmove @membre <salon vocal>")
     @commands.guild_only()
@@ -5486,6 +5581,94 @@ class Extras(commands.Cog):
         await msg.clear_reactions()
         await ctx.reply(embed=h.ok_embed("Réactions retirées."))
 
+    @commands.command(name="closeall", aliases=["closeserver", "raidlock"],
+                      help="En cas de raid : verrouille TOUS les salons écrits d'un coup.")
+    @commands.guild_only()
+    @h.is_owner_or(administrator=True)
+    @commands.bot_has_permissions(manage_channels=True)
+    async def closeall(self, ctx):
+        status = await ctx.send(embed=h.warn_embed("Verrouillage d'urgence en cours..."))
+        verrouilles = 0
+        for salon in ctx.guild.text_channels:
+            ow = salon.overwrites_for(ctx.guild.default_role)
+            if ow.send_messages is False:
+                continue
+            ow.send_messages = False
+            try:
+                await salon.set_permissions(ctx.guild.default_role, overwrite=ow,
+                                            reason=f"Closeall (raid) par {ctx.author}")
+                verrouilles += 1
+            except discord.HTTPException:
+                pass
+            await asyncio.sleep(0.25)
+        await status.edit(
+            embed=h.ok_embed(
+                f"\U0001f512 **{verrouilles}** salons verrouillés.\n"
+                f"Rouvre tout avec `{ctx.prefix}openall`."
+            )
+        )
+
+    @commands.command(name="openall", aliases=["openserver", "raidunlock"],
+                      help="Rouvre tous les salons après un closeall.")
+    @commands.guild_only()
+    @h.is_owner_or(administrator=True)
+    @commands.bot_has_permissions(manage_channels=True)
+    async def openall(self, ctx):
+        status = await ctx.send(embed=h.base_embed("Réouverture", "En cours..."))
+        ouverts = 0
+        for salon in ctx.guild.text_channels:
+            ow = salon.overwrites_for(ctx.guild.default_role)
+            if ow.send_messages is not False:
+                continue
+            ow.send_messages = None
+            try:
+                await salon.set_permissions(ctx.guild.default_role, overwrite=ow,
+                                            reason=f"Openall par {ctx.author}")
+                ouverts += 1
+            except discord.HTTPException:
+                pass
+            await asyncio.sleep(0.25)
+        await status.edit(embed=h.ok_embed(f"\U0001f513 **{ouverts}** salons rouverts."))
+
+    @commands.command(name="msg", aliases=["mp"],
+                      help="-msg <userid> <message> — envoie un MP à un membre.")
+    @commands.guild_only()
+    @h.is_owner_or(manage_messages=True)
+    async def msg(self, ctx, cible: str, *, message: str):
+        uid = cible.strip("<@!>")
+        if not uid.isdigit():
+            return await ctx.reply(embed=h.err_embed("Donne une mention ou un ID valide."))
+        membre = ctx.guild.get_member(int(uid))
+        if membre is None:
+            return await ctx.reply(embed=h.err_embed("Membre introuvable sur le serveur."))
+        e = h.base_embed(f"Message de {ctx.guild.name}", h.clean(message, 3000))
+        e.set_footer(text=f"Envoyé par le staff · {ctx.author}")
+        if await h.safe_dm(membre, e):
+            await ctx.reply(embed=h.ok_embed(f"MP envoyé à **{membre}**."), delete_after=8)
+        else:
+            await ctx.reply(embed=h.err_embed("Ses MP sont fermés."))
+
+    @commands.command(name="rep", aliases=["reply", "repondre"],
+                      help="-rep <messageid> <message> — répond à un message.")
+    @commands.guild_only()
+    @h.is_owner_or(manage_messages=True)
+    async def rep(self, ctx, message_id: int, *, texte: str):
+        try:
+            cible = await ctx.channel.fetch_message(message_id)
+        except discord.HTTPException:
+            return await ctx.reply(
+                embed=h.err_embed("Message introuvable dans ce salon.")
+            )
+        try:
+            await cible.reply(h.clean(texte, 1900),
+                              allowed_mentions=discord.AllowedMentions(users=True))
+        except discord.HTTPException:
+            return await ctx.reply(embed=h.err_embed("Impossible de répondre."))
+        try:
+            await ctx.message.delete()
+        except discord.HTTPException:
+            pass
+
 
 # ==============================================================================
 #  SECTION 13 - HARDBAN (anti-retour + anti-alt)
@@ -5906,7 +6089,476 @@ class Rules(commands.Cog):
 
 
 # ==============================================================================
-#  SECTION 15 - OUTILS (afk, tags, concours...)
+#  SECTION 15 - SALONS COMPTEURS DE STATS
+# ==============================================================================
+
+
+
+
+
+# Modèles par défaut. {count} est remplacé par le nombre.
+MODELES = {
+    "members": "\U0001f465 \u2022 Membres : {count}",
+    "humans":  "\U0001f9d1 \u2022 Humains : {count}",
+    "bots":    "\U0001f916 \u2022 Bots : {count}",
+    "online":  "\U0001f7e2 \u2022 En ligne : {count}",
+    "voice":   "\U0001f50a \u2022 En vocal : {count}",
+    "boosts":  "\U0001f680 \u2022 Boosts : {count}",
+}
+
+DESCRIPTIONS = {
+    "members": "nombre total de membres",
+    "humans": "membres humains",
+    "bots": "nombre de bots",
+    "online": "membres connectés",
+    "voice": "membres en vocal",
+    "boosts": "nombre de boosts",
+}
+
+
+class StatsChannels(commands.Cog):
+    """Salons vocaux affichant des compteurs en direct."""
+
+    def __init__(self, bot):
+        self.bot = bot
+        self.maj.start()
+
+    def cog_unload(self):
+        self.maj.cancel()
+
+    def valeur(self, guild: discord.Guild, kind: str) -> int:
+        if kind == "members":
+            return guild.member_count or len(guild.members)
+        if kind == "humans":
+            return sum(1 for m in guild.members if not m.bot)
+        if kind == "bots":
+            return sum(1 for m in guild.members if m.bot)
+        if kind == "online":
+            return sum(1 for m in guild.members
+                       if not m.bot and m.status is not discord.Status.offline)
+        if kind == "voice":
+            return sum(len(vc.members) for vc in guild.voice_channels)
+        if kind == "boosts":
+            return guild.premium_subscription_count or 0
+        return 0
+
+    # ------------------------------------------------------------ boucle
+    @tasks.loop(minutes=6)
+    async def maj(self):
+        try:
+            rows = await self.bot.db.all_stat_channels()
+        except Exception:
+            return
+        for row in rows:
+            guild = self.bot.get_guild(row["guild_id"])
+            if guild is None:
+                continue
+            salon = guild.get_channel(row["channel_id"])
+            if salon is None:
+                await self.bot.db.remove_stat_channel(row["channel_id"])
+                continue
+            modele = row["template"] or MODELES.get(row["kind"], "{count}")
+            nouveau_nom = modele.replace("{count}", f"{self.valeur(guild, row['kind']):,}")
+            if salon.name != nouveau_nom:
+                try:
+                    await salon.edit(name=nouveau_nom, reason="Compteur de stats")
+                except discord.HTTPException:
+                    pass
+                await asyncio.sleep(1.5)  # respecter la limite de renommage
+
+    @maj.before_loop
+    async def avant(self):
+        await self.bot.wait_until_ready()
+
+    # ------------------------------------------------------------ commandes
+    @commands.group(name="statschannels", aliases=["statschannel", "compteurs", "counter"],
+                    invoke_without_command=True,
+                    help="Salons vocaux affichant des compteurs en direct.")
+    @commands.guild_only()
+    @h.is_owner_or(administrator=True)
+    async def statschannels(self, ctx):
+        rows = await self.bot.db.stat_channels(ctx.guild.id)
+        p = ctx.prefix
+        if not rows:
+            corps = (
+                f"Aucun compteur pour l'instant.\n\n"
+                f"`{p}compteurs setup` — crée d'un coup Membres / En ligne / Vocal\n"
+                f"`{p}compteurs add <type>` — ajoute un compteur\n"
+                f"`{p}compteurs remove <#salon>` — supprime\n\n"
+                f"**Types :** {', '.join(f'`{k}`' for k in MODELES)}"
+            )
+        else:
+            lignes = []
+            for r in rows:
+                salon = ctx.guild.get_channel(r["channel_id"])
+                lignes.append(f"• {salon.mention if salon else r['channel_id']} — "
+                              f"`{r['kind']}`")
+            corps = "\n".join(lignes) + (
+                f"\n\n`{p}compteurs add <type>` · `{p}compteurs remove <#salon>`"
+            )
+        await ctx.reply(embed=h.base_embed("\U0001f4ca Salons compteurs", corps))
+
+    @statschannels.command(name="setup", aliases=["config"])
+    @h.is_owner_or(administrator=True)
+    @commands.bot_has_permissions(manage_channels=True)
+    async def sc_setup(self, ctx):
+        async with ctx.typing():
+            categorie = discord.utils.get(ctx.guild.categories, name="\U0001f4ca Statistiques")
+            if categorie is None:
+                # Personne ne doit pouvoir se connecter à ces salons vitrine.
+                overwrites = {
+                    ctx.guild.default_role: discord.PermissionOverwrite(connect=False)
+                }
+                categorie = await ctx.guild.create_category(
+                    "\U0001f4ca Statistiques", overwrites=overwrites,
+                    reason="Salons compteurs",
+                )
+            crees = []
+            for kind in ("members", "online", "voice"):
+                nom = MODELES[kind].replace("{count}", f"{self.valeur(ctx.guild, kind):,}")
+                salon = await ctx.guild.create_voice_channel(
+                    nom, category=categorie,
+                    overwrites={ctx.guild.default_role:
+                                discord.PermissionOverwrite(connect=False)},
+                    reason="Salon compteur",
+                )
+                await self.bot.db.add_stat_channel(
+                    ctx.guild.id, salon.id, kind, MODELES[kind]
+                )
+                crees.append(kind)
+                await asyncio.sleep(0.5)
+        await ctx.reply(
+            embed=h.ok_embed(
+                f"Compteurs créés : {', '.join(crees)}.\n"
+                f"Ils se mettent à jour toutes les 6 minutes (limite Discord)."
+            )
+        )
+
+    @statschannels.command(name="add", aliases=["ajouter"])
+    @h.is_owner_or(administrator=True)
+    @commands.bot_has_permissions(manage_channels=True)
+    async def sc_add(self, ctx, kind: str, *, modele: str = None):
+        kind = kind.lower()
+        if kind not in MODELES:
+            return await ctx.reply(
+                embed=h.err_embed(f"Type inconnu. Choix : {', '.join(MODELES)}")
+            )
+        modele = modele or MODELES[kind]
+        if "{count}" not in modele:
+            modele += " {count}"
+        categorie = discord.utils.get(ctx.guild.categories, name="\U0001f4ca Statistiques")
+        nom = modele.replace("{count}", f"{self.valeur(ctx.guild, kind):,}")
+        salon = await ctx.guild.create_voice_channel(
+            nom, category=categorie,
+            overwrites={ctx.guild.default_role:
+                        discord.PermissionOverwrite(connect=False)},
+            reason="Salon compteur",
+        )
+        await self.bot.db.add_stat_channel(ctx.guild.id, salon.id, kind, modele)
+        await ctx.reply(
+            embed=h.ok_embed(f"Compteur **{DESCRIPTIONS[kind]}** créé : {salon.mention}")
+        )
+
+    @statschannels.command(name="remove", aliases=["supprimer", "del"])
+    @h.is_owner_or(administrator=True)
+    @commands.bot_has_permissions(manage_channels=True)
+    async def sc_remove(self, ctx, salon: discord.VoiceChannel):
+        await self.bot.db.remove_stat_channel(salon.id)
+        try:
+            await salon.delete(reason="Compteur retiré")
+        except discord.HTTPException:
+            pass
+        await ctx.reply(embed=h.ok_embed("Compteur supprimé."))
+
+    @statschannels.command(name="refresh", aliases=["maj", "update"])
+    @h.is_owner_or(administrator=True)
+    async def sc_refresh(self, ctx):
+        rows = await self.bot.db.stat_channels(ctx.guild.id)
+        maj = 0
+        for r in rows:
+            salon = ctx.guild.get_channel(r["channel_id"])
+            if not salon:
+                continue
+            modele = r["template"] or MODELES.get(r["kind"], "{count}")
+            nom = modele.replace("{count}", f"{self.valeur(ctx.guild, r['kind']):,}")
+            if salon.name != nom:
+                try:
+                    await salon.edit(name=nom)
+                    maj += 1
+                except discord.HTTPException:
+                    pass
+                await asyncio.sleep(1.5)
+        await ctx.reply(
+            embed=h.ok_embed(f"**{maj}** compteur(s) rafraîchi(s) manuellement.")
+        )
+
+
+# ==============================================================================
+#  SECTION 16 - SYSTÈME DE LOGS
+# ==============================================================================
+
+
+
+
+
+class Logging(commands.Cog):
+    """Journaux d'événements du serveur."""
+
+    def __init__(self, bot):
+        self.bot = bot
+
+    async def envoyer(self, guild, colonne, embed):
+        cfg = await self.bot.db.log_config(guild.id)
+        if not cfg or not cfg["enabled"]:
+            return
+        chan_id = cfg[colonne]
+        if not chan_id:
+            return
+        salon = guild.get_channel(chan_id)
+        if salon:
+            try:
+                await salon.send(embed=embed)
+            except discord.HTTPException:
+                pass
+
+    # ================================================================ textuel
+
+    @commands.Cog.listener()
+    async def on_message_delete(self, message):
+        if not message.guild or message.author.bot:
+            return
+        e = h.base_embed(
+            "\U0001f5d1\ufe0f Message supprimé", color=config.COLOR_ERROR
+        )
+        e.add_field(name="Auteur", value=f"{message.author.mention} `{message.author.id}`",
+                    inline=True)
+        e.add_field(name="Salon", value=message.channel.mention, inline=True)
+        if message.content:
+            e.add_field(name="Contenu", value=h.clean(message.content, 1024), inline=False)
+        if message.attachments:
+            e.add_field(name="Pièces jointes",
+                        value=str(len(message.attachments)), inline=True)
+        e.set_footer(text=f"ID auteur : {message.author.id}")
+        await self.envoyer(message.guild, "log_text", e)
+
+    @commands.Cog.listener()
+    async def on_message_edit(self, before, after):
+        if not before.guild or before.author.bot or before.content == after.content:
+            return
+        e = h.base_embed("\u270f\ufe0f Message modifié", color=config.COLOR_WARN)
+        e.add_field(name="Auteur", value=f"{before.author.mention}", inline=True)
+        e.add_field(name="Salon", value=before.channel.mention, inline=True)
+        e.add_field(name="Avant", value=h.clean(before.content, 500) or "*vide*",
+                    inline=False)
+        e.add_field(name="Après", value=h.clean(after.content, 500) or "*vide*",
+                    inline=False)
+        e.add_field(name="Lien", value=f"[Aller au message]({after.jump_url})",
+                    inline=False)
+        await self.envoyer(before.guild, "log_text", e)
+
+    # ================================================================ modération
+
+    @commands.Cog.listener()
+    async def on_member_ban(self, guild, user):
+        e = h.base_embed("\U0001f528 Membre banni", color=config.COLOR_ERROR)
+        e.add_field(name="Membre", value=f"{user} `{user.id}`", inline=False)
+        await self._ajouter_auteur(guild, discord.AuditLogAction.ban, user.id, e)
+        await self.envoyer(guild, "log_mod", e)
+
+    @commands.Cog.listener()
+    async def on_member_unban(self, guild, user):
+        e = h.base_embed("\U0001f513 Membre débanni", color=config.COLOR_SUCCESS)
+        e.add_field(name="Membre", value=f"{user} `{user.id}`", inline=False)
+        await self.envoyer(guild, "log_mod", e)
+
+    @commands.Cog.listener()
+    async def on_member_update(self, before, after):
+        # Changements de rôles uniquement.
+        if before.roles == after.roles:
+            return
+        ajoutes = [r for r in after.roles if r not in before.roles]
+        retires = [r for r in before.roles if r not in after.roles]
+        if not ajoutes and not retires:
+            return
+        e = h.base_embed("\U0001f3ad Rôles modifiés", color=config.COLOR_PRIMARY)
+        e.add_field(name="Membre", value=after.mention, inline=False)
+        if ajoutes:
+            e.add_field(name="Ajoutés", value=", ".join(r.mention for r in ajoutes),
+                        inline=False)
+        if retires:
+            e.add_field(name="Retirés", value=", ".join(r.mention for r in retires),
+                        inline=False)
+        await self.envoyer(after.guild, "log_mod", e)
+
+    async def _ajouter_auteur(self, guild, action, cible_id, embed):
+        """Retrouve qui a fait l'action via le journal d'audit, si accessible."""
+        if not guild.me.guild_permissions.view_audit_log:
+            return
+        try:
+            async for entree in guild.audit_logs(limit=5, action=action):
+                if entree.target and entree.target.id == cible_id:
+                    embed.add_field(
+                        name="Par",
+                        value=entree.user.mention if entree.user else "?",
+                        inline=False,
+                    )
+                    if entree.reason:
+                        embed.add_field(name="Raison",
+                                        value=h.clean(entree.reason, 500), inline=False)
+                    return
+        except discord.HTTPException:
+            return
+
+    # ================================================================ vocal
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member, before, after):
+        if member.bot:
+            return
+        e = None
+        if before.channel is None and after.channel is not None:
+            e = h.base_embed("\U0001f50a Arrivée en vocal", color=config.COLOR_SUCCESS)
+            e.add_field(name="Membre", value=member.mention, inline=True)
+            e.add_field(name="Salon", value=after.channel.mention, inline=True)
+        elif before.channel is not None and after.channel is None:
+            e = h.base_embed("\U0001f507 Départ du vocal", color=config.COLOR_MUTED)
+            e.add_field(name="Membre", value=member.mention, inline=True)
+            e.add_field(name="Salon", value=before.channel.mention, inline=True)
+        elif before.channel != after.channel:
+            e = h.base_embed("\U0001f504 Déplacement vocal", color=config.COLOR_PRIMARY)
+            e.add_field(name="Membre", value=member.mention, inline=False)
+            e.add_field(name="De", value=before.channel.mention, inline=True)
+            e.add_field(name="Vers", value=after.channel.mention, inline=True)
+        if e:
+            await self.envoyer(member.guild, "log_voice", e)
+
+    # ================================================================ arrivées / départs
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member):
+        e = h.base_embed("\U0001f4e5 Membre arrivé", color=config.COLOR_SUCCESS)
+        e.add_field(name="Membre", value=f"{member.mention} `{member.id}`", inline=False)
+        e.add_field(name="Compte créé", value=h.ts(member.created_at), inline=True)
+        e.add_field(name="Membres", value=str(member.guild.member_count), inline=True)
+        e.set_thumbnail(url=member.display_avatar.url)
+        await self.envoyer(member.guild, "log_join", e)
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member):
+        e = h.base_embed("\U0001f4e4 Membre parti", color=config.COLOR_MUTED)
+        e.add_field(name="Membre", value=f"{member} `{member.id}`", inline=False)
+        roles = [r.mention for r in member.roles if r != member.guild.default_role]
+        if roles:
+            e.add_field(name="Rôles", value=h.clean(", ".join(roles), 500), inline=False)
+        e.set_thumbnail(url=member.display_avatar.url)
+        await self.envoyer(member.guild, "log_join", e)
+
+    # ================================================================ commandes
+
+    @commands.group(name="logs", aliases=["logging", "journaux"],
+                    invoke_without_command=True,
+                    help="Configure les journaux d'événements.")
+    @commands.guild_only()
+    @h.is_owner_or(administrator=True)
+    async def logs(self, ctx):
+        cfg = await self.bot.db.log_config(ctx.guild.id)
+        p = ctx.prefix
+
+        def salon(col):
+            c = ctx.guild.get_channel(cfg[col]) if cfg[col] else None
+            return c.mention if c else "*non défini*"
+
+        e = h.base_embed(
+            "\U0001f4cb Système de logs",
+            f"**État :** {'activé' if cfg['enabled'] else 'désactivé'}\n\n"
+            f"\U0001f4dd Textuel (suppr./édit.) : {salon('log_text')}\n"
+            f"\U0001f528 Modération (bans/rôles) : {salon('log_mod')}\n"
+            f"\U0001f50a Vocal (arrivées/départs) : {salon('log_voice')}\n"
+            f"\U0001f6aa Arrivées/départs membres : {salon('log_join')}\n\n"
+            f"`{p}logs setup` — crée tous les salons d'un coup\n"
+            f"`{p}logs textuel <#salon>`\n"
+            f"`{p}logs moderation <#salon>`\n"
+            f"`{p}logs vocal <#salon>`\n"
+            f"`{p}logs arrivees <#salon>`\n"
+            f"`{p}logs on|off`",
+        )
+        await ctx.reply(embed=e)
+
+    @logs.command(name="setup", aliases=["config"])
+    @h.is_owner_or(administrator=True)
+    @commands.bot_has_permissions(manage_channels=True)
+    async def logs_setup(self, ctx):
+        async with ctx.typing():
+            overwrites = {
+                ctx.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                ctx.guild.me: discord.PermissionOverwrite(view_channel=True,
+                                                          send_messages=True),
+            }
+            categorie = discord.utils.get(ctx.guild.categories, name="\U0001f4cb logs")
+            if categorie is None:
+                categorie = await ctx.guild.create_category(
+                    "\U0001f4cb logs", overwrites=overwrites, reason="Système de logs"
+                )
+            salons = {
+                "log_text": "logs-textuel",
+                "log_mod": "logs-moderation",
+                "log_voice": "logs-vocal",
+                "log_join": "logs-arrivees",
+            }
+            for colonne, nom in salons.items():
+                existant = discord.utils.get(ctx.guild.text_channels, name=nom)
+                if existant is None:
+                    existant = await ctx.guild.create_text_channel(
+                        nom, category=categorie, overwrites=overwrites,
+                        reason="Salon de logs",
+                    )
+                await self.bot.db.set_log(ctx.guild.id, colonne, existant.id)
+        await ctx.reply(
+            embed=h.ok_embed(
+                "Logs configurés : **logs-textuel**, **logs-moderation**, "
+                "**logs-vocal**, **logs-arrivees**.\nTout est déjà actif."
+            )
+        )
+
+    @logs.command(name="textuel", aliases=["text", "texte"])
+    @h.is_owner_or(administrator=True)
+    async def logs_text(self, ctx, salon: discord.TextChannel):
+        await self.bot.db.set_log(ctx.guild.id, "log_text", salon.id)
+        await ctx.reply(embed=h.ok_embed(f"Logs textuels dans {salon.mention}."))
+
+    @logs.command(name="moderation", aliases=["mod"])
+    @h.is_owner_or(administrator=True)
+    async def logs_mod(self, ctx, salon: discord.TextChannel):
+        await self.bot.db.set_log(ctx.guild.id, "log_mod", salon.id)
+        await ctx.reply(embed=h.ok_embed(f"Logs de modération dans {salon.mention}."))
+
+    @logs.command(name="vocal", aliases=["voice"])
+    @h.is_owner_or(administrator=True)
+    async def logs_voice(self, ctx, salon: discord.TextChannel):
+        await self.bot.db.set_log(ctx.guild.id, "log_voice", salon.id)
+        await ctx.reply(embed=h.ok_embed(f"Logs vocaux dans {salon.mention}."))
+
+    @logs.command(name="arrivees", aliases=["join", "arrivee"])
+    @h.is_owner_or(administrator=True)
+    async def logs_join(self, ctx, salon: discord.TextChannel):
+        await self.bot.db.set_log(ctx.guild.id, "log_join", salon.id)
+        await ctx.reply(embed=h.ok_embed(f"Logs d'arrivées/départs dans {salon.mention}."))
+
+    @logs.command(name="on")
+    @h.is_owner_or(administrator=True)
+    async def logs_on(self, ctx):
+        await self.bot.db.set_log(ctx.guild.id, "enabled", 1)
+        await ctx.reply(embed=h.ok_embed("Logs activés."))
+
+    @logs.command(name="off")
+    @h.is_owner_or(administrator=True)
+    async def logs_off(self, ctx):
+        await self.bot.db.set_log(ctx.guild.id, "enabled", 0)
+        await ctx.reply(embed=h.warn_embed("Logs désactivés."))
+
+
+# ==============================================================================
+#  SECTION 17 - OUTILS (afk, tags, concours...)
 # ==============================================================================
 
 
@@ -6500,7 +7152,7 @@ class Tools(commands.Cog):
 
 
 # ==============================================================================
-#  SECTION 16 - PANNEAU DE COMMANDES
+#  SECTION 18 - PANNEAU DE COMMANDES
 # ==============================================================================
 
 
@@ -6669,7 +7321,7 @@ class Panel(commands.Cog):
 
 
 # ==============================================================================
-#  SECTION 17 - SALONS VOCAUX TEMPORAIRES
+#  SECTION 19 - SALONS VOCAUX TEMPORAIRES
 # ==============================================================================
 
 
@@ -7245,7 +7897,7 @@ class TempVoice(commands.Cog):
 
 
 # ==============================================================================
-#  SECTION 18 - SCHEDULER (temp punishment expiry)
+#  SECTION 20 - SCHEDULER (temp punishment expiry)
 # ==============================================================================
 
 
@@ -7400,7 +8052,7 @@ class Scheduler(commands.Cog):
 
 
 # ==============================================================================
-#  SECTION 19 - HELP & UTILITY
+#  SECTION 21 - HELP & UTILITY
 # ==============================================================================
 
 
@@ -7705,7 +8357,7 @@ class Utility(commands.Cog):
 
 
 # ==============================================================================
-#  SECTION 20 - BOT CLASS & ENTRY POINT
+#  SECTION 22 - BOT CLASS & ENTRY POINT
 # ==============================================================================
 
 
@@ -7803,7 +8455,7 @@ class MyBot(commands.Bot):
         log.info("Database ready at %s", config.DB_PATH)
 
         for cog in (Moderation, AntiRaid, Tickets, Welcome,
-                    Stats, Fun, OpMod, Tools, VoiceStats, Extras, HardBan, Rules, Panel, TempVoice, Scheduler, Utility):
+                    Stats, Fun, OpMod, Tools, VoiceStats, Extras, HardBan, Rules, StatsChannels, Logging, Panel, TempVoice, Scheduler, Utility):
             try:
                 await self.add_cog(cog(self))
                 log.info("Loaded %s", cog.__name__)
