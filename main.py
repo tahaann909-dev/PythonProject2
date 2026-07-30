@@ -8432,6 +8432,7 @@ class MyBot(commands.Bot):
         intents.message_content = True  # required: prefix commands, automod
         intents.guilds = True
         intents.voice_states = True
+        intents.presences = True        # required: compteur "En ligne"
 
         super().__init__(
             command_prefix=get_prefix,
