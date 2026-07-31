@@ -5963,6 +5963,37 @@ DEFAULT_RULES = (
     "ce règlement."
 )
 
+RULE2_TITLE = "\u22c6-\U00010a5a\u02da\u0b94\u0d94 rules \u02da\u22c6"
+
+RULE2_TEXT = (
+    "**1. Respect :** Traitez tous les membres et le personnel avec respect. "
+    "Maintenez un environnement amical, mature et approprié.\n\n"
+    "**2. Pas de discours de haine :** Le racisme, le sexisme, l'homophobie ou "
+    "tout contenu dégradant sont strictement interdits. Soutenir ou adopter un "
+    "tel comportement entraînera un bannissement.\n\n"
+    "**3. Blagues appropriées :** Les blagues inappropriées sont strictement "
+    "interdites.\n\n"
+    "**4. Pas de NSFW :** Le contenu ou les discussions NSFW (y compris tout "
+    "matériel similaire) ne sont pas autorisés.\n\n"
+    "**5. Pas de publicité :** La publicité sur ce serveur est interdite.\n\n"
+    "**6. Vie privée :** Ne demandez pas, ne partagez pas et ne divulguez pas "
+    "d'informations personnelles. Cela est strictement interdit.\n\n"
+    "**7. Utilisation des salons :** Utilisez les salons uniquement pour l'usage "
+    "auquel ils sont destinés. Le spam ou la mauvaise utilisation des salons est "
+    "interdit.\n\n"
+    "**8. Pseudos :** Ne gardez pas de pseudos ou surnoms inappropriés ; ils "
+    "seront modérés.\n\n"
+    "**9. Filtres :** Tenter de contourner les filtres de mots ou le système "
+    "d'auto-modération du serveur est interdit.\n\n"
+    "**10. Pas de menaces :** Les menaces de toute nature envers les membres ou "
+    "quiconque ne seront pas tolérées.\n\n"
+    "**11. Pas de contournement des règles :** N'essayez pas de contourner les "
+    "règles du serveur.\n\n"
+    "**12. Pas de mendicité :** Demander de manière insistante des objets "
+    "gratuits tels que des boosts, des gamepasses ou des produits n'est pas "
+    "autorisé."
+)
+
 
 class RulesView(discord.ui.View):
     """Bouton d'acceptation persistant."""
@@ -6086,6 +6117,52 @@ class Rules(commands.Cog):
                 f"**Acceptations :** {row['accepted'] if row else 0}",
             )
         )
+
+    @commands.command(name="rule2", aliases=["rules2", "reglement2"],
+                      help="Publie le règlement prédéfini ; le bouton donne le rôle Verified.")
+    @commands.guild_only()
+    @h.is_owner_or(manage_guild=True)
+    @commands.bot_has_permissions(manage_roles=True)
+    async def rule2(self, ctx):
+        # Rôle Verified : on le récupère ou on le crée.
+        role = discord.utils.find(
+            lambda r: r.name.lower() == "verified", ctx.guild.roles
+        )
+        if role is None:
+            try:
+                role = await ctx.guild.create_role(
+                    name="Verified",
+                    colour=discord.Colour.from_rgb(88, 101, 242),
+                    reason="Rôle d'accès au règlement",
+                )
+            except discord.Forbidden:
+                return await ctx.reply(
+                    embed=h.err_embed("Je ne peux pas créer le rôle Verified — "
+                                      "vérifie mes permissions.")
+                )
+        if role >= ctx.guild.me.top_role:
+            return await ctx.reply(
+                embed=h.err_embed(
+                    "Le rôle **Verified** est au-dessus du mien — je ne pourrai pas "
+                    "l'attribuer. Monte mon rôle plus haut dans les paramètres."
+                )
+            )
+
+        await self.bot.db.set_rules(ctx.guild.id, "role_id", role.id)
+        await self.bot.db.set_rules(ctx.guild.id, "content", RULE2_TEXT)
+
+        e = h.base_embed(RULE2_TITLE, RULE2_TEXT, config.COLOR_PRIMARY)
+        if ctx.guild.icon:
+            e.set_thumbnail(url=ctx.guild.icon.url)
+        e.set_footer(text="Clique sur le bouton pour accepter et recevoir le rôle Verified.")
+        msg = await ctx.send(embed=e, view=RulesView(self.bot))
+        await self.bot.db.set_rules(ctx.guild.id, "channel_id", ctx.channel.id)
+        await self.bot.db.set_rules(ctx.guild.id, "message_id", msg.id)
+        # petit accusé, auto-effacé
+        try:
+            await ctx.message.delete()
+        except discord.HTTPException:
+            pass
 
 
 # ==============================================================================
@@ -8594,3 +8671,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nArrêt en cours.")
+ 
