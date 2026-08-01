@@ -350,6 +350,27 @@ def chunk(seq, size):
         yield seq[i:i + size]
 
 
+async def resolve_member(guild, texte):
+    """
+    Résout un membre depuis une mention (<@123>) ou un ID brut.
+    Interroge l'API si le membre n'est pas en cache (indispensable sur les gros
+    serveurs où tout n'est pas mis en cache). Renvoie (membre, erreur_ou_None).
+    """
+    uid = str(texte).strip().strip("<@!>")
+    if not uid.isdigit():
+        return None, "Donne une mention ou un ID valide."
+    membre = guild.get_member(int(uid))
+    if membre is not None:
+        return membre, None
+    try:
+        membre = await guild.fetch_member(int(uid))
+        return membre, None
+    except discord.NotFound:
+        return None, "Ce membre n'est pas sur le serveur."
+    except discord.HTTPException:
+        return None, "ID introuvable."
+
+
 # ==============================================================================
 #  SECTION 3 - DATABASE
 # ==============================================================================
@@ -4959,12 +4980,9 @@ class VoiceStats(commands.Cog):
     @commands.guild_only()
     @h.is_owner_or(move_members=True)
     async def move(self, ctx, cible: str, *, salon: discord.VoiceChannel = None):
-        uid = cible.strip("<@!>")
-        if not uid.isdigit():
-            return await ctx.reply(embed=h.err_embed("Donne une mention ou un ID valide."))
-        membre = ctx.guild.get_member(int(uid))
-        if membre is None:
-            return await ctx.reply(embed=h.err_embed("Membre introuvable."))
+        membre, err = await h.resolve_member(ctx.guild, cible)
+        if err:
+            return await ctx.reply(embed=h.err_embed(err))
         if membre.voice is None:
             return await ctx.reply(embed=h.err_embed("Ce membre n'est pas en vocal."))
         # Sans salon indiqué : on l'amène dans le tien.
@@ -4982,12 +5000,9 @@ class VoiceStats(commands.Cog):
     @h.is_owner_or(manage_roles=True)
     @commands.bot_has_permissions(manage_roles=True)
     async def setrole(self, ctx, cible: str, *, nom_role: str):
-        uid = cible.strip("<@!>")
-        if not uid.isdigit():
-            return await ctx.reply(embed=h.err_embed("Donne une mention ou un ID valide."))
-        membre = ctx.guild.get_member(int(uid))
-        if membre is None:
-            return await ctx.reply(embed=h.err_embed("Membre introuvable."))
+        membre, err = await h.resolve_member(ctx.guild, cible)
+        if err:
+            return await ctx.reply(embed=h.err_embed(err))
         role = discord.utils.find(
             lambda r: r.name.lower() == nom_role.lower(), ctx.guild.roles
         )
@@ -5640,7 +5655,14 @@ class Extras(commands.Cog):
             return await ctx.reply(embed=h.err_embed("Donne une mention ou un ID valide."))
         membre = ctx.guild.get_member(int(uid))
         if membre is None:
-            return await ctx.reply(embed=h.err_embed("Membre introuvable sur le serveur."))
+            try:
+                membre = await ctx.guild.fetch_member(int(uid))
+            except discord.NotFound:
+                return await ctx.reply(
+                    embed=h.err_embed("Ce membre n'est pas sur le serveur.")
+                )
+            except discord.HTTPException:
+                return await ctx.reply(embed=h.err_embed("ID introuvable."))
         e = h.base_embed(f"Message de {ctx.guild.name}", h.clean(message, 3000))
         e.set_footer(text=f"Envoyé par le staff · {ctx.author}")
         if await h.safe_dm(membre, e):
@@ -8671,4 +8693,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nArrêt en cours.")
- 
