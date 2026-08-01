@@ -2444,30 +2444,34 @@ class AntiRaid(commands.Cog):
         recent = [x for x in self.messages[key] if now - x[0] <= cfg["msg_window"]]
 
         violation = None
+        contenu = message.content.strip()
 
-        # rate
+        # rate : trop de messages trop vite (vrai spam)
         if len(recent) >= cfg["msg_threshold"]:
             violation = f"{len(recent)} messages en {cfg['msg_window']}s"
-        # duplicates
-        elif len(recent) >= cfg["dupe_threshold"]:
-            tail = [c for _, c in recent[-cfg["dupe_threshold"]:]]
-            if tail[0] and len(set(tail)) == 1:
+        # doublons : on exige des messages NON triviaux (≥ 8 caractères) pour ne
+        # pas punir les "ok", "mdr", "ptdr" répétés en discussion normale, et un
+        # seuil plus élevé.
+        elif len(recent) >= max(cfg["dupe_threshold"], 5):
+            tail = [c for _, c in recent[-max(cfg["dupe_threshold"], 5):]]
+            if tail[0] and len(tail[0]) >= 8 and len(set(tail)) == 1:
                 violation = f"a répété le même message {len(tail)} fois"
-        # mass mention
+        # mention de masse
         mentions = len(message.mentions) + len(message.role_mentions)
         if not violation and mentions >= cfg["mention_limit"]:
             violation = f"mention de masse ({mentions} mentions)"
-        # invites
+        # invitations
         if not violation and INVITE_RE.search(message.content):
             if not message.author.guild_permissions.manage_guild:
                 violation = "a posté une invitation de serveur"
-        # zalgo / unicode abuse
+        # zalgo / abus unicode
         if not violation and ZALGO_RE.search(message.content):
             violation = "a posté du texte zalgo"
-        # caps flood
-        if not violation and len(message.content) >= 20:
-            letters = [c for c in message.content if c.isalpha()]
-            if letters and sum(c.isupper() for c in letters) / len(letters) > 0.8:
+        # majuscules : bien plus tolérant — texte long (≥ 40) et quasi tout en
+        # majuscules (> 90 %), pour ne pas punir un simple "MERCI TOUT LE MONDE".
+        if not violation and len(contenu) >= 40:
+            letters = [c for c in contenu if c.isalpha()]
+            if letters and sum(c.isupper() for c in letters) / len(letters) > 0.9:
                 violation = "majuscules excessives"
 
         if violation:
@@ -2484,11 +2488,34 @@ class AntiRaid(commands.Cog):
         except discord.HTTPException:
             pass
 
+        # Premier avertissement : on supprime juste le message et on prévient,
+        # SANS mute. La sanction n'arrive qu'en cas de récidive immédiate.
+        if strikes < 2:
+            try:
+                await message.channel.send(
+                    embed=h.warn_embed(
+                        f"{member.mention}, doucement — évite le spam. "
+                        f"(prochaine fois = sanction)"
+                    ),
+                    delete_after=6,
+                )
+            except discord.HTTPException:
+                pass
+            await self.alert(
+                message.guild, "Automod — avertissement",
+                f"{member.mention} `{member.id}` — {violation} (1er, non sanctionné)",
+                config.COLOR_WARN,
+            )
+            # L'avertissement retombe vite pour ne pas s'accumuler à tort.
+            await asyncio.sleep(60)
+            self.strikes[key] = max(0, self.strikes[key] - 1)
+            return
+
         action = cfg["spam_action"]
-        # Escalate: repeat offenders get harsher treatment regardless of config.
-        if strikes >= 5 and action == "mute":
+        # Escalade pour les vrais récidivistes.
+        if strikes >= 6 and action == "mute":
             action = "kick"
-        if strikes >= 8:
+        if strikes >= 9:
             action = "ban"
 
         applied = "message supprimé"
@@ -3393,6 +3420,42 @@ class Welcome(commands.Cog):
         cfg = await self.bot.db.welcome(ctx.guild.id)
         text = self.render(cfg["welcome_message"], ctx.author)
         await ctx.reply(embed=self.welcome_embed(ctx.author, text), mention_author=False)
+
+    @commands.command(name="autorole", aliases=["autorolemembre"],
+                      help="-autorole <@role|nom> — rôle donné auto à chaque arrivée. Sans argument : désactive.")
+    @commands.guild_only()
+    @h.is_owner_or(manage_guild=True)
+    @commands.bot_has_permissions(manage_roles=True)
+    async def autorole(self, ctx, *, role: str = None):
+        if role is None:
+            await self.bot.db.set_welcome(ctx.guild.id, "autorole", None)
+            return await ctx.reply(embed=h.ok_embed("Rôle automatique désactivé."))
+        # Accepte une mention, un ID ou un nom.
+        r = None
+        clean_id = role.strip("<@&>")
+        if clean_id.isdigit():
+            r = ctx.guild.get_role(int(clean_id))
+        if r is None:
+            r = discord.utils.find(lambda x: x.name.lower() == role.lower(), ctx.guild.roles)
+        if r is None:
+            r = discord.utils.find(lambda x: role.lower() in x.name.lower(), ctx.guild.roles)
+        if r is None:
+            return await ctx.reply(
+                embed=h.err_embed(f"Aucun rôle nommé « {h.clean(role, 50)} ».")
+            )
+        if r >= ctx.guild.me.top_role:
+            return await ctx.reply(
+                embed=h.err_embed(
+                    f"Le rôle {r.mention} est au-dessus du mien — je ne pourrai pas "
+                    f"l'attribuer. Monte mon rôle plus haut dans les paramètres."
+                )
+            )
+        await self.bot.db.set_welcome(ctx.guild.id, "autorole", r.id)
+        await ctx.reply(
+            embed=h.ok_embed(
+                f"Chaque nouveau membre recevra automatiquement {r.mention} à l'arrivée."
+            )
+        )
 
     @welcome.command(name="autorole")
     @h.is_owner_or(manage_guild=True)
@@ -8525,13 +8588,13 @@ class AutoContext(commands.Context):
 
 
 class MyBot(commands.Bot):
-    def __init__(self):
+    def __init__(self, with_presences: bool = True):
         intents = discord.Intents.default()
         intents.members = True          # required: welcome/goodbye, anti-raid
         intents.message_content = True  # required: prefix commands, automod
         intents.guilds = True
         intents.voice_states = True
-        intents.presences = True        # required: compteur "En ligne"
+        intents.presences = with_presences  # compteur "En ligne" (privilégié)
 
         super().__init__(
             command_prefix=get_prefix,
@@ -8683,9 +8746,30 @@ async def main():
     if not config.TOKEN:
         print("No DISCORD_TOKEN set. Put it in a .env file:\n  DISCORD_TOKEN=...")
         sys.exit(1)
+
     bot = MyBot()
-    async with bot:
-        await bot.start(config.TOKEN)
+    try:
+        async with bot:
+            await bot.start(config.TOKEN)
+    except discord.PrivilegedIntentsRequired:
+        log.warning(
+            "Un intent privilégié n'est pas activé dans le portail Discord "
+            "(probablement PRESENCE INTENT). Redémarrage sans 'presences' — le "
+            "compteur 'En ligne' sera inexact tant que tu ne l'auras pas coché "
+            "sur https://discord.com/developers/applications -> Bot -> "
+            "Privileged Gateway Intents."
+        )
+        bot = MyBot(with_presences=False)
+        try:
+            async with bot:
+                await bot.start(config.TOKEN)
+        except discord.PrivilegedIntentsRequired:
+            log.error(
+                "Il manque toujours un intent privilégié. Active SERVER MEMBERS "
+                "INTENT et MESSAGE CONTENT INTENT dans le portail Discord, puis "
+                "relance."
+            )
+            sys.exit(1)
 
 
 if __name__ == "__main__":
