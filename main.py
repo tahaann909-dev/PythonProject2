@@ -533,6 +533,12 @@ CREATE TABLE IF NOT EXISTS sticky (
     last_id     INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS media_channels (
+    channel_id  INTEGER PRIMARY KEY,
+    guild_id    INTEGER NOT NULL,
+    mute_minutes INTEGER DEFAULT 10
+);
+
 CREATE TABLE IF NOT EXISTS stat_channels (
     guild_id    INTEGER NOT NULL,
     channel_id  INTEGER NOT NULL,
@@ -882,6 +888,29 @@ class Database:
     async def claim_ticket(self, channel_id, mod_id):
         await self.execute(
             "UPDATE tickets SET claimed_by=? WHERE channel_id=?", (mod_id, channel_id)
+        )
+
+    # ------------------------------------------------------------ salons média uniquement
+    async def add_media_channel(self, channel_id, guild_id, mute_minutes):
+        await self.execute(
+            "INSERT OR REPLACE INTO media_channels (channel_id,guild_id,mute_minutes)"
+            " VALUES (?,?,?)",
+            (channel_id, guild_id, mute_minutes),
+        )
+
+    async def get_media_channel(self, channel_id):
+        return await self.fetchone(
+            "SELECT * FROM media_channels WHERE channel_id=?", (channel_id,)
+        )
+
+    async def remove_media_channel(self, channel_id):
+        await self.execute(
+            "DELETE FROM media_channels WHERE channel_id=?", (channel_id,)
+        )
+
+    async def all_media_channels(self, guild_id):
+        return await self.fetchall(
+            "SELECT * FROM media_channels WHERE guild_id=?", (guild_id,)
         )
 
     # ------------------------------------------------------------ salons compteurs
@@ -6305,7 +6334,7 @@ class StatsChannels(commands.Cog):
         return 0
 
     # ------------------------------------------------------------ boucle
-    @tasks.loop(minutes=6)
+    @tasks.loop(minutes=15)
     async def maj(self):
         try:
             rows = await self.bot.db.all_stat_channels()
@@ -6392,7 +6421,7 @@ class StatsChannels(commands.Cog):
         await ctx.reply(
             embed=h.ok_embed(
                 f"Compteurs créés : {', '.join(crees)}.\n"
-                f"Ils se mettent à jour toutes les 6 minutes (limite Discord)."
+                f"Ils se mettent à jour toutes les 15 minutes (limite Discord)."
             )
         )
 
@@ -6650,6 +6679,17 @@ class Logging(commands.Cog):
     @h.is_owner_or(administrator=True)
     @commands.bot_has_permissions(manage_channels=True)
     async def logs_setup(self, ctx):
+        await self._faire_setup(ctx)
+
+    @commands.command(name="setlogs", aliases=["setuplogs", "createlogs"],
+                      help="Crée les salons de logs et y envoie tous les logs automatiquement.")
+    @commands.guild_only()
+    @h.is_owner_or(administrator=True)
+    @commands.bot_has_permissions(manage_channels=True)
+    async def setlogs(self, ctx):
+        await self._faire_setup(ctx)
+
+    async def _faire_setup(self, ctx):
         async with ctx.typing():
             overwrites = {
                 ctx.guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -6675,10 +6715,13 @@ class Logging(commands.Cog):
                         reason="Salon de logs",
                     )
                 await self.bot.db.set_log(ctx.guild.id, colonne, existant.id)
+            # On s'assure que les logs sont bien activés.
+            await self.bot.db.set_log(ctx.guild.id, "enabled", 1)
         await ctx.reply(
             embed=h.ok_embed(
-                "Logs configurés : **logs-textuel**, **logs-moderation**, "
-                "**logs-vocal**, **logs-arrivees**.\nTout est déjà actif."
+                "Logs configurés et **activés** : **logs-textuel**, "
+                "**logs-moderation**, **logs-vocal**, **logs-arrivees**.\n"
+                "Tout est envoyé automatiquement dans les salons créés."
             )
         )
 
@@ -6720,7 +6763,171 @@ class Logging(commands.Cog):
 
 
 # ==============================================================================
-#  SECTION 17 - OUTILS (afk, tags, concours...)
+#  SECTION 17 - SALONS PHOTO UNIQUEMENT
+# ==============================================================================
+
+
+
+
+
+IMAGE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".heic", ".tiff")
+IMAGE_URL_RE = re.compile(
+    r"https?://\S+\.(?:png|jpe?g|gif|webp|bmp|heic|tiff)(?:\?\S*)?", re.IGNORECASE
+)
+
+
+class MediaOnly(commands.Cog):
+    """Salons où seules les photos sont autorisées."""
+
+    def __init__(self, bot):
+        self.bot = bot
+
+    def a_une_image(self, message: discord.Message) -> bool:
+        # 1) pièce jointe image
+        for a in message.attachments:
+            if a.content_type and a.content_type.startswith("image"):
+                return True
+            if a.filename.lower().endswith(IMAGE_EXT):
+                return True
+        # 2) embed image/vignette (lien d'image collé)
+        for e in message.embeds:
+            if e.type in ("image", "gifv") or e.image or e.thumbnail:
+                return True
+        # 3) lien direct vers une image dans le texte
+        if IMAGE_URL_RE.search(message.content):
+            return True
+        # 4) sticker (une image aussi)
+        if message.stickers:
+            return True
+        return False
+
+    def est_exempt(self, member: discord.Member) -> bool:
+        if member.bot:
+            return True
+        if member.id in config.OWNER_IDS or member.guild.owner_id == member.id:
+            return True
+        p = member.guild_permissions
+        return p.administrator or p.manage_messages or p.manage_guild
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if not message.guild or message.author.bot:
+            return
+        row = await self.bot.db.get_media_channel(message.channel.id)
+        if not row:
+            return
+        if self.est_exempt(message.author):
+            return
+        # Un message avec image : autorisé, on ne touche à rien.
+        if self.a_une_image(message):
+            return
+        # Certains liens (Tenor, Imgur page) mettent une seconde à générer leur
+        # embed image. On laisse une petite chance avant de sévir.
+        if message.content and ("tenor.com" in message.content
+                                or "imgur.com" in message.content
+                                or "giphy.com" in message.content):
+            await asyncio.sleep(2)
+            try:
+                message = await message.channel.fetch_message(message.id)
+            except discord.HTTPException:
+                return
+            if self.a_une_image(message):
+                return
+
+        # Message texte pur dans un salon photo -> suppression + mute.
+        minutes = row["mute_minutes"] or 10
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass
+
+        applied = "message supprimé"
+        try:
+            until = discord.utils.utcnow() + datetime.timedelta(minutes=minutes)
+            await message.author.timeout(until, reason=f"Salon photo uniquement : "
+                                                       f"message texte dans {message.channel}")
+            applied = f"muet {minutes} min"
+        except discord.HTTPException:
+            pass
+
+        await self.bot.db.add_case(
+            message.guild.id, message.author.id, self.bot.user.id,
+            "mediaonly-mute", f"texte dans le salon photo {message.channel}",
+        )
+
+        # Petit rappel auto-effacé, pour que la personne comprenne.
+        try:
+            await message.channel.send(
+                embed=h.warn_embed(
+                    f"{message.author.mention}, ce salon est **réservé aux photos**. "
+                    f"Ton message texte a été supprimé et tu es muet **{minutes} min**."
+                ),
+                delete_after=8,
+            )
+        except discord.HTTPException:
+            pass
+
+        # Log modération si configuré.
+        cog_log = self.bot.get_cog("Logging")
+        if cog_log:
+            e = h.base_embed(
+                "\U0001f4f7 Salon photo — message texte bloqué",
+                f"**Membre :** {message.author.mention} `{message.author.id}`\n"
+                f"**Salon :** {message.channel.mention}\n"
+                f"**Sanction :** {applied}",
+                config.COLOR_WARN,
+            )
+            await cog_log.envoyer(message.guild, "log_mod", e)
+
+    # ------------------------------------------------------------ commandes
+    @commands.group(name="mediaonly", aliases=["photoonly", "photouniquement", "salonphoto"],
+                    invoke_without_command=True,
+                    help="Salon où seules les photos sont autorisées.")
+    @commands.guild_only()
+    @h.is_owner_or(manage_channels=True)
+    async def mediaonly(self, ctx):
+        rows = await self.bot.db.all_media_channels(ctx.guild.id)
+        p = ctx.prefix
+        if not rows:
+            corps = (
+                f"Aucun salon photo configuré.\n\n"
+                f"`{p}mediaonly add [#salon] [minutes]` — active (10 min par défaut)\n"
+                f"`{p}mediaonly remove [#salon]` — désactive\n\n"
+                f"Dans un salon actif, un message **sans photo** est supprimé et "
+                f"l'auteur est rendu muet."
+            )
+        else:
+            lignes = []
+            for r in rows:
+                salon = ctx.guild.get_channel(r["channel_id"])
+                lignes.append(f"• {salon.mention if salon else r['channel_id']} — "
+                              f"mute {r['mute_minutes']} min")
+            corps = "\n".join(lignes) + f"\n\n`{p}mediaonly remove #salon` pour retirer."
+        await ctx.reply(embed=h.base_embed("\U0001f4f7 Salons photo uniquement", corps))
+
+    @mediaonly.command(name="add", aliases=["set", "on"])
+    @h.is_owner_or(manage_channels=True)
+    async def mo_add(self, ctx, salon: discord.TextChannel = None, minutes: int = 10):
+        salon = salon or ctx.channel
+        minutes = max(1, min(minutes, 60 * 24 * 28))  # limite du timeout Discord
+        await self.bot.db.add_media_channel(salon.id, ctx.guild.id, minutes)
+        await ctx.reply(
+            embed=h.ok_embed(
+                f"{salon.mention} est maintenant **photo uniquement**.\n"
+                f"Un message sans image = supprimé + mute **{minutes} min**."
+            )
+        )
+
+    @mediaonly.command(name="remove", aliases=["del", "off"])
+    @h.is_owner_or(manage_channels=True)
+    async def mo_remove(self, ctx, salon: discord.TextChannel = None):
+        salon = salon or ctx.channel
+        await self.bot.db.remove_media_channel(salon.id)
+        await ctx.reply(embed=h.ok_embed(f"{salon.mention} n'est plus restreint aux photos."))
+
+
+# ==============================================================================
+#  SECTION 18 - OUTILS (afk, tags, concours...)
 # ==============================================================================
 
 
@@ -7314,7 +7521,7 @@ class Tools(commands.Cog):
 
 
 # ==============================================================================
-#  SECTION 18 - PANNEAU DE COMMANDES
+#  SECTION 19 - PANNEAU DE COMMANDES
 # ==============================================================================
 
 
@@ -7483,7 +7690,7 @@ class Panel(commands.Cog):
 
 
 # ==============================================================================
-#  SECTION 19 - SALONS VOCAUX TEMPORAIRES
+#  SECTION 20 - SALONS VOCAUX TEMPORAIRES
 # ==============================================================================
 
 
@@ -8059,7 +8266,7 @@ class TempVoice(commands.Cog):
 
 
 # ==============================================================================
-#  SECTION 20 - SCHEDULER (temp punishment expiry)
+#  SECTION 21 - SCHEDULER (temp punishment expiry)
 # ==============================================================================
 
 
@@ -8214,7 +8421,7 @@ class Scheduler(commands.Cog):
 
 
 # ==============================================================================
-#  SECTION 21 - HELP & UTILITY
+#  SECTION 22 - HELP & UTILITY
 # ==============================================================================
 
 
@@ -8519,7 +8726,7 @@ class Utility(commands.Cog):
 
 
 # ==============================================================================
-#  SECTION 22 - BOT CLASS & ENTRY POINT
+#  SECTION 23 - BOT CLASS & ENTRY POINT
 # ==============================================================================
 
 
@@ -8618,7 +8825,7 @@ class MyBot(commands.Bot):
         log.info("Database ready at %s", config.DB_PATH)
 
         for cog in (Moderation, AntiRaid, Tickets, Welcome,
-                    Stats, Fun, OpMod, Tools, VoiceStats, Extras, HardBan, Rules, StatsChannels, Logging, Panel, TempVoice, Scheduler, Utility):
+                    Stats, Fun, OpMod, Tools, VoiceStats, Extras, HardBan, Rules, StatsChannels, Logging, MediaOnly, Panel, TempVoice, Scheduler, Utility):
             try:
                 await self.add_cog(cog(self))
                 log.info("Loaded %s", cog.__name__)
