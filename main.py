@@ -130,8 +130,8 @@ ANTIRAID_DEFAULTS = {
     "join_window": 10,          # ...within this many seconds = raid
     "min_account_age_days": 3,  # les comptes plus récents sont suspects
     # message-spam detection
-    "msg_threshold": 7,         # this many messages...
-    "msg_window": 5,            # ...in this many seconds = spam
+    "msg_threshold": 30,         # this many messages...
+    "msg_window": 7,            # ...in this many seconds = spam
     "dupe_threshold": 4,        # identical messages in a row
     "mention_limit": 6,         # mass-mention ceiling per message
     # what to do
@@ -396,8 +396,8 @@ CREATE TABLE IF NOT EXISTS antiraid (
     join_threshold      INTEGER DEFAULT 8,
     join_window         INTEGER DEFAULT 10,
     min_account_age_days INTEGER DEFAULT 3,
-    msg_threshold       INTEGER DEFAULT 7,
-    msg_window          INTEGER DEFAULT 5,
+    msg_threshold       INTEGER DEFAULT 30,
+    msg_window          INTEGER DEFAULT 7,
     dupe_threshold      INTEGER DEFAULT 4,
     mention_limit       INTEGER DEFAULT 6,
     raid_action         TEXT    DEFAULT 'lockdown',
@@ -674,6 +674,14 @@ class Database:
                     await self.conn.execute(
                         f"ALTER TABLE {table} ADD COLUMN {name} {kind}"
                     )
+        # Relève l'ancien seuil anti-flood (7) vers le nouveau (30) sur les
+        # serveurs déjà configurés, sans écraser un réglage volontairement élevé.
+        await self.conn.execute(
+            "UPDATE antiraid SET msg_threshold=30 WHERE msg_threshold < 30"
+        )
+        await self.conn.execute(
+            "UPDATE antiraid SET msg_window=7 WHERE msg_window < 7"
+        )
         await self.conn.commit()
 
     async def close(self):
@@ -2239,7 +2247,7 @@ class AntiRaid(commands.Cog):
         # guild_id -> deque[timestamp]
         self.joins: dict[int, deque] = defaultdict(lambda: deque(maxlen=200))
         # (guild_id, user_id) -> deque[(timestamp, content_hash)]
-        self.messages: dict[tuple, deque] = defaultdict(lambda: deque(maxlen=40))
+        self.messages: dict[tuple, deque] = defaultdict(lambda: deque(maxlen=80))
         # guild_id -> unix timestamp when raid mode ends
         self.raid_until: dict[int, float] = {}
         # rate-limit our own alerts
