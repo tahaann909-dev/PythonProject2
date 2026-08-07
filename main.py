@@ -5434,6 +5434,108 @@ class Extras(commands.Cog):
         cat = await ctx.guild.create_category(nom[:100], reason=f"Créé par {ctx.author}")
         await ctx.reply(embed=h.ok_embed(f"Catégorie **{cat.name}** créée."))
 
+    @commands.command(name="allchannelcreate", aliases=["setupserver", "buildserver",
+                                                        "createall"],
+                      help="Construit toute la structure du serveur : catégories, salons écrits et vocaux.")
+    @commands.guild_only()
+    @h.is_owner_or(administrator=True)
+    @commands.bot_has_permissions(manage_channels=True)
+    async def allchannelcreate(self, ctx):
+        # Plan de serveur complet. (nom_categorie, [salons texte], [salons vocaux])
+        PLAN = [
+            ("\U0001f4cb Informations",
+             ["règlement", "annonces", "mises-à-jour", "rôles"],
+             []),
+            ("\U0001f4ac Général",
+             ["général", "discussion", "commandes-bot", "memes", "médias"],
+             ["Général", "Musique"]),
+            ("\U0001f3ae Vocal",
+             [],
+             ["Vocal 1", "Vocal 2", "\u300e+\u300f Créer votre salon", "AFK"]),
+            ("\U0001f3ab Support",
+             ["ouvrir-un-ticket"],
+             []),
+            ("\U0001f4cb Logs",
+             ["logs-textuel", "logs-moderation", "logs-vocal", "logs-arrivees"],
+             []),
+            ("\U0001f4ca Statistiques",
+             [],
+             ["\U0001f465 \u2022 Membres : 0", "\U0001f7e2 \u2022 En ligne : 0",
+              "\U0001f50a \u2022 En vocal : 0"]),
+            ("\U0001f6e0\ufe0f Staff",
+             ["salon-staff", "logs-staff", "sanctions"],
+             ["Vocal Staff"]),
+        ]
+
+        confirm = await ctx.reply(
+            embed=h.warn_embed(
+                f"Je vais créer **{len(PLAN)}** catégories avec leurs salons "
+                f"écrits et vocaux. Les salons existants du même nom ne sont pas "
+                f"touchés (je crée en plus).\n\nTape `confirm` sous 20 secondes."
+            )
+        )
+        try:
+            await self.bot.wait_for(
+                "message", timeout=20,
+                check=lambda mm: mm.author == ctx.author and mm.channel == ctx.channel
+                and mm.content.lower() == "confirm",
+            )
+        except asyncio.TimeoutError:
+            return await confirm.edit(embed=h.err_embed("Annulé."))
+
+        cats = txt = voc = 0
+        status = await ctx.send(embed=h.base_embed("Construction", "En cours..."))
+        for nom_cat, salons_txt, salons_voc in PLAN:
+            try:
+                categorie = await ctx.guild.create_category(
+                    nom_cat, reason=f"allchannelcreate par {ctx.author}"
+                )
+                cats += 1
+            except discord.HTTPException:
+                continue
+            await asyncio.sleep(0.4)
+            for nom_salon in salons_txt:
+                try:
+                    await ctx.guild.create_text_channel(
+                        nom_salon, category=categorie,
+                        reason=f"allchannelcreate par {ctx.author}",
+                    )
+                    txt += 1
+                except discord.HTTPException:
+                    pass
+                await asyncio.sleep(0.4)
+            for nom_salon in salons_voc:
+                try:
+                    await ctx.guild.create_voice_channel(
+                        nom_salon, category=categorie,
+                        reason=f"allchannelcreate par {ctx.author}",
+                    )
+                    voc += 1
+                except discord.HTTPException:
+                    pass
+                await asyncio.sleep(0.4)
+            try:
+                await status.edit(
+                    embed=h.base_embed(
+                        "Construction",
+                        f"**{cats}** catégories · **{txt}** salons écrits · "
+                        f"**{voc}** vocaux...",
+                    )
+                )
+            except discord.HTTPException:
+                pass
+
+        await status.edit(
+            embed=h.ok_embed(
+                f"Serveur construit :\n"
+                f"**{cats}** catégories · **{txt}** salons écrits · "
+                f"**{voc}** salons vocaux.\n\n"
+                f"Pense à lancer `{ctx.prefix}setlogs`, `{ctx.prefix}compteurs setup` "
+                f"et `{ctx.prefix}voice setup` pour relier logs, compteurs et "
+                f"salons temporaires."
+            )
+        )
+
     @commands.command(name="deletechannel", aliases=["delchannel"],
                       help="Supprime un salon.")
     @commands.guild_only()
