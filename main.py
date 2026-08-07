@@ -5441,37 +5441,101 @@ class Extras(commands.Cog):
     @h.is_owner_or(administrator=True)
     @commands.bot_has_permissions(manage_channels=True)
     async def allchannelcreate(self, ctx):
-        # Plan de serveur complet. (nom_categorie, [salons texte], [salons vocaux])
+        # Chaque salon a un "profil" de permissions pour @everyone :
+        #   normal    : écrire, images, fichiers, réactions (salon de discussion)
+        #   readonly  : lecture seule (annonces, règlement, rôles)
+        #   images    : uniquement des images/fichiers, pas de texte seul
+        #   staff     : caché à tout le monde sauf staff
+        #   hidden    : caché (logs)
+        #   voice     : salon vocal normal
+        #   voicelock : salon vocal où on ne peut pas parler (compteurs)
+        #
+        # Plan : (nom_categorie, profil_categorie, [(nom_salon, profil)], [(nom_vocal, profil)])
         PLAN = [
-            ("\U0001f4cb Informations",
-             ["règlement", "annonces", "mises-à-jour", "rôles"],
-             []),
-            ("\U0001f4ac Général",
-             ["général", "discussion", "commandes-bot", "memes", "médias"],
-             ["Général", "Musique"]),
-            ("\U0001f3ae Vocal",
-             [],
-             ["Vocal 1", "Vocal 2", "\u300e+\u300f Créer votre salon", "AFK"]),
-            ("\U0001f3ab Support",
-             ["ouvrir-un-ticket"],
-             []),
-            ("\U0001f4cb Logs",
-             ["logs-textuel", "logs-moderation", "logs-vocal", "logs-arrivees"],
-             []),
-            ("\U0001f4ca Statistiques",
-             [],
-             ["\U0001f465 \u2022 Membres : 0", "\U0001f7e2 \u2022 En ligne : 0",
-              "\U0001f50a \u2022 En vocal : 0"]),
-            ("\U0001f6e0\ufe0f Staff",
-             ["salon-staff", "logs-staff", "sanctions"],
-             ["Vocal Staff"]),
+            ("\U0001f4cb Informations", "readonly", [
+                ("règlement", "readonly"), ("annonces", "readonly"),
+                ("mises-à-jour", "readonly"), ("rôles", "readonly"),
+            ], []),
+            ("\U0001f4ac Général", "normal", [
+                ("général", "normal"), ("discussion", "normal"),
+                ("commandes-bot", "normal"), ("memes", "normal"),
+                ("photos", "images"),
+            ], [("Général", "voice"), ("Musique", "voice")]),
+            ("\U0001f3ae Vocal", "voice", [], [
+                ("Vocal 1", "voice"), ("Vocal 2", "voice"),
+                ("\u300e+\u300f Créer votre salon", "voice"), ("AFK", "voice"),
+            ]),
+            ("\U0001f3ab Support", "normal", [
+                ("ouvrir-un-ticket", "readonly"),
+            ], []),
+            ("\U0001f4cb Logs", "hidden", [
+                ("logs-textuel", "hidden"), ("logs-moderation", "hidden"),
+                ("logs-vocal", "hidden"), ("logs-arrivees", "hidden"),
+            ], []),
+            ("\U0001f4ca Statistiques", "voicelock", [], [
+                ("\U0001f465 \u2022 Membres : 0", "voicelock"),
+                ("\U0001f7e2 \u2022 En ligne : 0", "voicelock"),
+                ("\U0001f50a \u2022 En vocal : 0", "voicelock"),
+            ]),
+            ("\U0001f6e0\ufe0f Staff", "staff", [
+                ("salon-staff", "staff"), ("logs-staff", "staff"),
+                ("sanctions", "staff"),
+            ], [("Vocal Staff", "staff")]),
         ]
+
+        everyone = ctx.guild.default_role
+        me = ctx.guild.me
+        # Rôle staff : on prend le premier rôle nommé "staff" / "modérateur" / "admin".
+        staff_role = discord.utils.find(
+            lambda r: any(x in r.name.lower() for x in ("staff", "modé", "mod", "admin")),
+            ctx.guild.roles,
+        )
+
+        def perms_pour(profil):
+            """Renvoie le dict d'overwrites pour @everyone (+ staff/bot) selon le profil."""
+            ow = {me: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, connect=True,
+                manage_channels=True, read_message_history=True)}
+            if profil == "normal":
+                ow[everyone] = discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, attach_files=True,
+                    embed_links=True, add_reactions=True, read_message_history=True)
+            elif profil == "readonly":
+                ow[everyone] = discord.PermissionOverwrite(
+                    view_channel=True, send_messages=False, add_reactions=False,
+                    read_message_history=True)
+            elif profil == "images":
+                # Voir + envoyer + joindre des fichiers ; le filtrage "texte seul
+                # interdit" est assuré par le système mediaonly (voir plus bas).
+                ow[everyone] = discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, attach_files=True,
+                    embed_links=True, add_reactions=True, read_message_history=True)
+            elif profil == "staff":
+                ow[everyone] = discord.PermissionOverwrite(view_channel=False)
+                if staff_role:
+                    ow[staff_role] = discord.PermissionOverwrite(
+                        view_channel=True, send_messages=True, connect=True,
+                        read_message_history=True)
+            elif profil == "hidden":
+                ow[everyone] = discord.PermissionOverwrite(view_channel=False)
+                if staff_role:
+                    ow[staff_role] = discord.PermissionOverwrite(
+                        view_channel=True, read_message_history=True)
+            elif profil == "voice":
+                ow[everyone] = discord.PermissionOverwrite(
+                    view_channel=True, connect=True, speak=True)
+            elif profil == "voicelock":
+                # Salon vitrine (compteurs) : visible mais on ne peut pas s'y connecter.
+                ow[everyone] = discord.PermissionOverwrite(
+                    view_channel=True, connect=False)
+            return ow
 
         confirm = await ctx.reply(
             embed=h.warn_embed(
-                f"Je vais créer **{len(PLAN)}** catégories avec leurs salons "
-                f"écrits et vocaux. Les salons existants du même nom ne sont pas "
-                f"touchés (je crée en plus).\n\nTape `confirm` sous 20 secondes."
+                f"Je vais créer **{len(PLAN)}** catégories avec leurs salons, "
+                f"**et poser les permissions de chaque salon** selon son usage "
+                f"(général = tout ; photos = images ; annonces = lecture seule ; "
+                f"staff/logs = cachés).\n\nTape `confirm` sous 20 secondes."
             )
         )
         try:
@@ -5484,30 +5548,36 @@ class Extras(commands.Cog):
             return await confirm.edit(embed=h.err_embed("Annulé."))
 
         cats = txt = voc = 0
+        salons_images = []  # pour activer le mode "photos uniquement" ensuite
         status = await ctx.send(embed=h.base_embed("Construction", "En cours..."))
-        for nom_cat, salons_txt, salons_voc in PLAN:
+        for nom_cat, profil_cat, salons_txt, salons_voc in PLAN:
             try:
                 categorie = await ctx.guild.create_category(
-                    nom_cat, reason=f"allchannelcreate par {ctx.author}"
+                    nom_cat, overwrites=perms_pour(profil_cat),
+                    reason=f"allchannelcreate par {ctx.author}",
                 )
                 cats += 1
             except discord.HTTPException:
                 continue
             await asyncio.sleep(0.4)
-            for nom_salon in salons_txt:
+            for nom_salon, profil in salons_txt:
                 try:
-                    await ctx.guild.create_text_channel(
+                    salon = await ctx.guild.create_text_channel(
                         nom_salon, category=categorie,
+                        overwrites=perms_pour(profil),
                         reason=f"allchannelcreate par {ctx.author}",
                     )
                     txt += 1
+                    if profil == "images":
+                        salons_images.append(salon.id)
                 except discord.HTTPException:
                     pass
                 await asyncio.sleep(0.4)
-            for nom_salon in salons_voc:
+            for nom_salon, profil in salons_voc:
                 try:
                     await ctx.guild.create_voice_channel(
                         nom_salon, category=categorie,
+                        overwrites=perms_pour(profil),
                         reason=f"allchannelcreate par {ctx.author}",
                     )
                     voc += 1
@@ -5525,11 +5595,21 @@ class Extras(commands.Cog):
             except discord.HTTPException:
                 pass
 
+        # Active automatiquement le mode "photos uniquement" sur les salons images.
+        for cid in salons_images:
+            try:
+                await self.bot.db.add_media_channel(cid, ctx.guild.id, 10)
+            except Exception:
+                pass
+
         await status.edit(
             embed=h.ok_embed(
                 f"Serveur construit :\n"
                 f"**{cats}** catégories · **{txt}** salons écrits · "
                 f"**{voc}** salons vocaux.\n\n"
+                f"**Permissions posées automatiquement :** général = tout, "
+                f"#photos = images uniquement, annonces/règlement = lecture seule, "
+                f"staff/logs = cachés, compteurs = verrouillés.\n\n"
                 f"Pense à lancer `{ctx.prefix}setlogs`, `{ctx.prefix}compteurs setup` "
                 f"et `{ctx.prefix}voice setup` pour relier logs, compteurs et "
                 f"salons temporaires."
