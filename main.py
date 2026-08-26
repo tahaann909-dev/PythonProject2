@@ -630,6 +630,27 @@ CREATE TABLE IF NOT EXISTS collars (
     PRIMARY KEY (guild_id, user_id)
 );
 
+
+CREATE TABLE IF NOT EXISTS selfroles (
+    guild_id    INTEGER NOT NULL,
+    role_id     INTEGER NOT NULL,
+    label       TEXT,
+    emoji       TEXT,
+    description TEXT,
+    added_at    INTEGER,
+    PRIMARY KEY (guild_id, role_id)
+);
+
+CREATE TABLE IF NOT EXISTS selfrole_panel (
+    guild_id    INTEGER PRIMARY KEY,
+    channel_id  INTEGER,
+    message_id  INTEGER,
+    title       TEXT,
+    description TEXT,
+    placeholder TEXT,
+    multiple    INTEGER DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_cases_user ON cases(guild_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_temp_pending ON temp_actions(done, expires_at);
 CREATE INDEX IF NOT EXISTS idx_tickets_owner ON tickets(guild_id, owner_id, open);
@@ -1250,6 +1271,39 @@ class Database:
     async def collars_of(self, guild_id, owner_id):
         return await self.fetchall(
             "SELECT * FROM collars WHERE guild_id=? AND owner_id=?", (guild_id, owner_id)
+        )
+
+    # ------------------------------------------------------------ self-roles
+    async def add_selfrole(self, guild_id, role_id, label, emoji, description):
+        await self.execute(
+            "INSERT OR REPLACE INTO selfroles"
+            " (guild_id,role_id,label,emoji,description,added_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (guild_id, role_id, label, emoji, description, int(time.time())),
+        )
+
+    async def remove_selfrole(self, guild_id, role_id):
+        await self.execute(
+            "DELETE FROM selfroles WHERE guild_id=? AND role_id=?",
+            (guild_id, role_id),
+        )
+
+    async def selfroles(self, guild_id):
+        return await self.fetchall(
+            "SELECT * FROM selfroles WHERE guild_id=? ORDER BY added_at",
+            (guild_id,),
+        )
+
+    async def selfrole_panel(self, guild_id):
+        await self._ensure_row("selfrole_panel", guild_id)
+        return await self.fetchone(
+            "SELECT * FROM selfrole_panel WHERE guild_id=?", (guild_id,)
+        )
+
+    async def set_selfrole_panel(self, guild_id, key, value):
+        await self._ensure_row("selfrole_panel", guild_id)
+        await self.execute(
+            f"UPDATE selfrole_panel SET {key}=? WHERE guild_id=?", (value, guild_id)
         )
 
 
@@ -3631,7 +3685,7 @@ class Stats(commands.Cog):
         await self.bot.db.bump_stat(message.guild.id, message.author.id, "messages")
         if message.content:
             await self.bot.db.bump_stat(
-                message.guild.id, message.author.id, "caractères", len(message.content)
+                message.guild.id, message.author.id, "characters", len(message.content)
             )
         if message.attachments:
             await self.bot.db.bump_stat(
@@ -3673,7 +3727,7 @@ class Stats(commands.Cog):
         db = self.bot.db
         row = await db.get_stats(ctx.guild.id, member.id)
         messages = row["messages"] if row else 0
-        chars = row["caractères"] if row else 0
+        chars = row["characters"] if row else 0
         attachments = row["attachments"] if row else 0
         reactions = row["reactions_given"] if row else 0
         voice = row["voice_seconds"] if row else 0
@@ -3812,7 +3866,7 @@ class Stats(commands.Cog):
             "vc": ("voice_seconds", "temps en vocal", None),
             "commands": ("commands", "commandes exécutées", "{:,}"),
             "réactions": ("reactions_given", "réactions", "{:,}"),
-            "chars": ("caractères", "caractères", "{:,}"),
+            "chars": ("characters", "caractères", "{:,}"),
         }
         key = field.lower()
         if key not in mapping:
@@ -4018,20 +4072,32 @@ class Fun(commands.Cog):
 
     # ================================================================ claim
 
-    @commands.command(
-        name="claim",
-        aliases=["collar", "ls"],
-        help="Proposer à quelqu'un le pseudo '<label> de <toi>'. Il doit accepter.",
+        @commands.command(
+        name="ls",
+        aliases=["claim", "collar"],
+        help="-ls @user <label> — Verrouille un membre en vocal et le renomme de force.",
     )
     @commands.guild_only()
-    @commands.bot_has_permissions(manage_nicknames=True)
-    @commands.cooldown(2, 30, commands.BucketType.user)
-    async def claim(self, ctx, member: discord.Member, *, label: str = "soumise"):
+    @commands.bot_has_permissions(manage_nicknames=True, move_members=True)
+    @h.is_owner_or(manage_nicknames=True)
+    async def ls(self, ctx, member: discord.Member, *, label: str = "soumise"):
         if member.bot:
-            return await ctx.reply(embed=h.err_embed("Les bots ne consentent à rien."),
+            return await ctx.reply(embed=h.err_embed("Les bots ne peuvent pas être verrouillés."),
                                    mention_author=False)
         if member.id == ctx.author.id:
-            return await ctx.reply(embed=h.err_embed("Te réclamer toi-même ? Utilise `-nick`."),
+            return await ctx.reply(embed=h.err_embed("Tu ne peux pas te verrouiller toi-même."),
+                                   mention_author=False)
+
+        allowed, why = h.bot_can_act(ctx.guild.me, member)
+        if not allowed:
+            return await ctx.reply(embed=h.err_embed(why), mention_author=False)
+
+        allowed, why = h.hierarchy_ok(ctx.author, member)
+        if not allowed:
+            return await ctx.reply(embed=h.err_embed(why), mention_author=False)
+
+        if member.voice is None or member.voice.channel is None:
+            return await ctx.reply(embed=h.err_embed("Ce membre n'est pas dans un salon vocal."),
                                    mention_author=False)
 
         label = h.clean(label, 16).strip() or "soumise"
@@ -4039,60 +4105,88 @@ class Fun(commands.Cog):
             return await ctx.reply(embed=h.err_embed("Le label doit rester du texte simple."),
                                    mention_author=False)
 
-        allowed, why = h.bot_can_act(ctx.guild.me, member)
-        if not allowed:
-            return await ctx.reply(embed=h.err_embed(why), mention_author=False)
-
         proposed = f"{label} de {ctx.author.display_name}"[:32]
-
-        e = h.base_embed(
-            "\U0001f517 Demande de réclamation",
-            (
-                f"{ctx.author.mention} veut te renommer en :\n\n"
-                f"### {h.clean(proposed, 40)}\n\n"
-                f"Toi seul peux répondre. Refuse librement — il ne se passe rien et "
-                f"personne n'est prévenu. Tu peux annuler plus tard avec "
-                f"`{ctx.prefix}uncollar` quand tu veux."
-            ),
-            config.COLOR_WARN,
-        )
-        e.set_thumbnail(url=member.display_avatar.url)
-        e.set_footer(text="Expire dans 90 secondes")
-
-        view = ClaimView(ctx.author, member, label)
-        view.message = await ctx.send(content=member.mention, embed=e, view=view)
-        await view.wait()
-
-        if view.result is None:
-            return
-        if view.result is False:
-            return await view.message.edit(
-                embed=h.base_embed(
-                    "Refusé",
-                    f"{member.display_name} a dit non. C'est exactement le but de cette fonction.",
-                    config.COLOR_MUTED,
-                ),
-                view=None,
-            )
-
+        target_channel = member.voice.channel
         old_nick = member.nick
+
         try:
-            await member.edit(nick=proposed, reason=f"Consensual claim by {ctx.author}")
+            await member.edit(nick=proposed, reason=f"Lock by {ctx.author}")
         except discord.Forbidden:
-            return await view.message.edit(
-                embed=h.err_embed("Discord a bloqué le renommage — mon rôle est trop bas."),
-                view=None,
-            )
+            return await ctx.reply(embed=h.err_embed("Je ne peux pas renommer ce membre."),
+                                   mention_author=False)
 
         await self.bot.db.set_collar(ctx.guild.id, member.id, ctx.author.id, old_nick)
-        await view.message.edit(
-            embed=h.ok_embed(
-                f"**{member.display_name}** a accepté. "
-                f"Annulable à tout moment avec `{ctx.prefix}uncollar`."
-            ),
-            view=None,
-        )
 
+        async def monitor_voice():
+            while True:
+                await asyncio.sleep(1)
+                try:
+                    current_vc = member.voice
+                    if current_vc is None or current_vc.channel is None:
+                        await member.move_to(target_channel)
+                    elif current_vc.channel != target_channel:
+                        await member.move_to(target_channel)
+                except (discord.HTTPException, AttributeError):
+                    pass
+
+        if hasattr(self.bot, 'lock_tasks') and member.id in self.bot.lock_tasks:
+            self.bot.lock_tasks[member.id].cancel()
+
+        if not hasattr(self.bot, 'lock_tasks'):
+            self.bot.lock_tasks = {}
+
+        task = ctx.bot.loop.create_task(monitor_voice())
+        self.bot.lock_tasks[member.id] = task
+
+        await ctx.reply(
+            embed=h.ok_embed(
+                f"**{member.display_name}** est maintenant verrouillé dans "
+                f"{target_channel.mention} et renommé **{proposed}**.\n"
+                f"Libère-le avec `{ctx.prefix}unls @{member.name}`."
+            ),
+            mention_author=False,
+        )
+    @commands.command(
+        name="unls",
+        aliases=["uncollar", "unclaim", "release"],
+        help="-unls @user — Libère un membre verrouillé.",
+    )
+    @commands.guild_only()
+    @commands.bot_has_permissions(manage_nicknames=True, move_members=True)
+    @h.is_owner_or(manage_nicknames=True)
+    async def unls(self, ctx, member: discord.Member = None):
+        target = member or ctx.author
+        row = await self.bot.db.get_collar(ctx.guild.id, target.id)
+        if not row:
+            return await ctx.reply(embed=h.warn_embed("Ce membre n'est pas verrouillé."),
+                                   mention_author=False)
+
+        allowed = (
+            ctx.author.id == target.id
+            or ctx.author.id == row["owner_id"]
+            or ctx.author.guild_permissions.manage_nicknames
+        )
+        if not allowed:
+            return await ctx.reply(
+                embed=h.err_embed("Seuls l'intéressé, la personne qui l'a verrouillé ou le staff "
+                                  "peuvent le libérer."),
+                mention_author=False,
+            )
+
+        if hasattr(ctx.bot, 'lock_tasks') and target.id in ctx.bot.lock_tasks:
+            ctx.bot.lock_tasks[target.id].cancel()
+            del ctx.bot.lock_tasks[target.id]
+
+        try:
+            await target.edit(nick=row["old_nick"], reason=f"Unlock by {ctx.author}")
+        except discord.Forbidden:
+            pass
+
+        await self.bot.db.remove_collar(ctx.guild.id, target.id)
+        await ctx.reply(embed=h.ok_embed(f"**{target.display_name}** libéré."),
+                        mention_author=False
+                       )
+      
     @commands.command(name="uncollar", aliases=["unclaim", "release"],
                       help="Annuler ton propre pseudo, ou libérer quelqu'un que tu as réclamé.")
     @commands.guild_only()
@@ -7777,6 +7871,8 @@ FICHES = {
         (f"{E}deletechannel [salon]", "Supprime un salon"),
         (f"{E}hidechannel / {E}showchannel", "Masque / réaffiche un salon"),
         (f"{E}nuke", "Recrée le salon (efface tout)"),
+        (f'{E}addrolecS "nom" [emoji]', "Ajoute un rôle au menu de choix"),
+        (f"{E}rolepanel [#salon]", "Publie le menu « choisis ton rôle »"),
     ]),
     "Vocal": ("\U0001f39b\ufe0f", B, [
         (f"{B}vckick <@user>", "Déconnecte du vocal"),
@@ -8597,8 +8693,8 @@ class Scheduler(commands.Cog):
         # Refresh presence with the current guild count.
         try:
             await self.bot.change_presence(
-                activity=discord.Activité(
-                    type=discord.ActivitéType.watching,
+                activity=discord.Activity(
+                    type=discord.ActivityType.watching,
                     name=f"{config.PREFIX}help | {len(self.bot.guilds)} servers",
                 )
             )
@@ -8915,6 +9011,434 @@ class Utility(commands.Cog):
         )
 
 
+
+
+# ==============================================================================
+#  SECTION 22b - MENU DE SÉLECTION DE RÔLE (self-roles)
+# ==============================================================================
+
+
+CUSTOM_EMOJI_RE = re.compile(r"<a?:\w+:\d+>")
+
+TITRE_DEFAUT = "Sélectionne ton rôle d'affichage"
+PLACEHOLDER_DEFAUT = "Choisis ton rôle"
+
+
+def est_emoji(texte: str) -> bool:
+    """Vrai si le texte ressemble à un émoji (personnalisé ou unicode)."""
+    if not texte:
+        return False
+    if CUSTOM_EMOJI_RE.fullmatch(texte):
+        return True
+    if len(texte) > 8:
+        return False
+    return all(ord(c) > 0x2000 for c in texte)
+
+
+def trouver_role(guild: discord.Guild, texte: str):
+    """Accepte une mention, un ID ou un nom (exact puis partiel)."""
+    brut = texte.strip().strip("<@&>")
+    if brut.isdigit():
+        role = guild.get_role(int(brut))
+        if role:
+            return role
+    cible = texte.strip().lower()
+    role = discord.utils.find(lambda r: r.name.lower() == cible, guild.roles)
+    if role:
+        return role
+    return discord.utils.find(lambda r: cible in r.name.lower(), guild.roles)
+
+
+def construire_options(guild: discord.Guild, rows, multiple: bool):
+    """Transforme les lignes de la base en options de menu déroulant."""
+    options = []
+    for r in rows[:24]:  # 24 + l'option « retirer » = 25, le maximum Discord
+        role = guild.get_role(r["role_id"])
+        if role is None:
+            continue
+        options.append(
+            discord.SelectOption(
+                label=(r["label"] or role.name)[:100],
+                value=str(role.id),
+                description=(r["description"] or None),
+                emoji=(r["emoji"] or None),
+            )
+        )
+    if options:
+        options.append(
+            discord.SelectOption(
+                label="Retirer mon rôle",
+                value="__none__",
+                description="Enlève le ou les rôles pris ici",
+                emoji="\u274c",
+            )
+        )
+    return options
+
+
+class SelfRoleSelect(discord.ui.Select):
+    """
+    Menu persistant. Au redémarrage, les vraies options viennent du message
+    déjà publié sur Discord : celles d'ici ne servent que de remplissage pour
+    que discord.py accepte l'objet.
+    """
+
+    def __init__(self, options=None, multiple=False, placeholder=None):
+        opts = options or [discord.SelectOption(label="\u2014", value="__none__")]
+        super().__init__(
+            placeholder=placeholder or PLACEHOLDER_DEFAUT,
+            options=opts,
+            custom_id="selfrole:select",
+            min_values=0,
+            max_values=len(opts) if multiple else 1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        bot = interaction.client
+        guild = interaction.guild
+        membre = interaction.user
+
+        rows = await bot.db.selfroles(guild.id)
+        panel = await bot.db.selfrole_panel(guild.id)
+        multiple = bool(panel and panel["multiple"])
+
+        gerables = [
+            role for role in (guild.get_role(r["role_id"]) for r in rows)
+            if role is not None
+        ]
+        if not gerables:
+            return await interaction.response.send_message(
+                embed=h.err_embed("Aucun rôle n'est configuré dans ce menu."),
+                ephemeral=True,
+            )
+
+        vider = "__none__" in self.values
+        choisis = []
+        if not vider:
+            for valeur in self.values:
+                if valeur.isdigit():
+                    role = guild.get_role(int(valeur))
+                    if role in gerables:
+                        choisis.append(role)
+
+        me = guild.me
+        if any(r >= me.top_role for r in choisis):
+            return await interaction.response.send_message(
+                embed=h.err_embed(
+                    "Ce rôle est au-dessus du mien, je ne peux pas l'attribuer. "
+                    "Préviens le staff."
+                ),
+                ephemeral=True,
+            )
+
+        possede = [r for r in gerables if r in membre.roles]
+
+        if vider:
+            a_ajouter, a_retirer = [], [r for r in possede if r < me.top_role]
+        elif multiple:
+            # En mode multiple, on bascule : un rôle déjà pris est retiré.
+            a_ajouter = [r for r in choisis if r not in possede]
+            a_retirer = [r for r in choisis if r in possede and r < me.top_role]
+        else:
+            # Mode unique : le rôle choisi remplace l'ancien.
+            a_ajouter = [r for r in choisis if r not in possede]
+            a_retirer = [r for r in possede if r not in choisis and r < me.top_role]
+
+        if not a_ajouter and not a_retirer:
+            return await interaction.response.send_message(
+                embed=h.base_embed(description="Rien à changer."), ephemeral=True
+            )
+
+        try:
+            if a_retirer:
+                await membre.remove_roles(*a_retirer, reason="Menu de rôles")
+            if a_ajouter:
+                await membre.add_roles(*a_ajouter, reason="Menu de rôles")
+        except discord.Forbidden:
+            return await interaction.response.send_message(
+                embed=h.err_embed(
+                    "Discord a refusé — mon rôle doit être au-dessus de ceux du menu."
+                ),
+                ephemeral=True,
+            )
+        except discord.HTTPException:
+            return await interaction.response.send_message(
+                embed=h.err_embed("Échec de la modification des rôles."),
+                ephemeral=True,
+            )
+
+        lignes = []
+        if a_ajouter:
+            lignes.append("**Ajouté :** " + ", ".join(r.mention for r in a_ajouter))
+        if a_retirer:
+            lignes.append("**Retiré :** " + ", ".join(r.mention for r in a_retirer))
+        await interaction.response.send_message(
+            embed=h.ok_embed("\n".join(lignes)), ephemeral=True
+        )
+
+
+class SelfRolePanelView(discord.ui.View):
+    def __init__(self, bot=None, options=None, multiple=False, placeholder=None):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.add_item(SelfRoleSelect(options, multiple, placeholder))
+
+
+class SelfRoles(commands.Cog):
+    """Menu déroulant permettant aux membres de choisir leur rôle."""
+
+    def __init__(self, bot):
+        self.bot = bot
+
+    # ------------------------------------------------------------ helpers
+
+    def _panel_embed(self, guild, panel) -> discord.Embed:
+        e = h.base_embed(
+            panel["title"] or TITRE_DEFAUT,
+            panel["description"] or None,
+        )
+        if guild.icon:
+            e.set_thumbnail(url=guild.icon.url)
+        return e
+
+    async def _publier(self, guild, salon, panel, rows):
+        options = construire_options(guild, rows, bool(panel["multiple"]))
+        if not options:
+            return None
+        vue = SelfRolePanelView(
+            self.bot, options, bool(panel["multiple"]), panel["placeholder"]
+        )
+        return await salon.send(embed=self._panel_embed(guild, panel), view=vue)
+
+    # ------------------------------------------------------------ commandes
+
+    @commands.command(
+        name="addrolecs",
+        aliases=["addrolec", "addselfrole", "ajouterrolec"],
+        help='-addrolecS "nom du role" [emoji] [description] — ajoute un rôle au menu.',
+    )
+    @commands.guild_only()
+    @h.is_owner_or(manage_roles=True)
+    @commands.bot_has_permissions(manage_roles=True)
+    async def addrolecs(self, ctx, role: str, emoji: str = None, *,
+                        description: str = None):
+        # Si le 2e argument n'est pas un émoji, c'est en fait le début de la
+        # description : on recolle les morceaux.
+        if emoji and not est_emoji(emoji):
+            description = f"{emoji} {description}".strip() if description else emoji
+            emoji = None
+
+        cible = trouver_role(ctx.guild, role)
+        if cible is None:
+            return await ctx.reply(
+                embed=h.err_embed(
+                    f"Aucun rôle nommé « {h.clean(role, 50)} ».\n"
+                    f'Utilise des guillemets : `{ctx.prefix}addrolecS "Mon rôle"`'
+                )
+            )
+        if cible.is_default():
+            return await ctx.reply(embed=h.err_embed("Pas @everyone."))
+        if cible.managed:
+            return await ctx.reply(
+                embed=h.err_embed("Ce rôle est géré par une intégration.")
+            )
+        if cible >= ctx.guild.me.top_role:
+            return await ctx.reply(
+                embed=h.err_embed(
+                    f"{cible.mention} est au-dessus de mon rôle — je ne pourrai pas "
+                    f"l'attribuer. Monte mon rôle plus haut dans les paramètres."
+                )
+            )
+        if cible >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+            return await ctx.reply(embed=h.err_embed("Ce rôle est au-dessus du tien."))
+
+        rows = await self.bot.db.selfroles(ctx.guild.id)
+        if len(rows) >= 24 and not any(r["role_id"] == cible.id for r in rows):
+            return await ctx.reply(
+                embed=h.err_embed(
+                    "Le menu est plein : Discord limite à 24 rôles par menu."
+                )
+            )
+
+        await self.bot.db.add_selfrole(
+            ctx.guild.id, cible.id, cible.name,
+            emoji, h.clean(description, 90) if description else None,
+        )
+        rows = await self.bot.db.selfroles(ctx.guild.id)
+        await ctx.reply(
+            embed=h.ok_embed(
+                f"{cible.mention} ajouté au menu ({len(rows)} rôle(s)).\n"
+                f"Publie ou rafraîchis le menu avec `{ctx.prefix}rolepanel`."
+            )
+        )
+        await self._auto_refresh(ctx.guild)
+
+    @commands.command(
+        name="delrolecs",
+        aliases=["removerolecs", "delrolec", "delselfrole"],
+        help='-delrolecS "nom du role" — retire un rôle du menu.',
+    )
+    @commands.guild_only()
+    @h.is_owner_or(manage_roles=True)
+    async def delrolecs(self, ctx, *, role: str):
+        cible = trouver_role(ctx.guild, role)
+        if cible is None:
+            return await ctx.reply(
+                embed=h.err_embed(f"Aucun rôle nommé « {h.clean(role, 50)} ».")
+            )
+        await self.bot.db.remove_selfrole(ctx.guild.id, cible.id)
+        await ctx.reply(embed=h.ok_embed(f"{cible.mention} retiré du menu."))
+        await self._auto_refresh(ctx.guild)
+
+    @commands.command(
+        name="listrolecs",
+        aliases=["rolecs", "selfroles", "listrolec"],
+        help="Liste les rôles proposés dans le menu.",
+    )
+    @commands.guild_only()
+    async def listrolecs(self, ctx):
+        rows = await self.bot.db.selfroles(ctx.guild.id)
+        if not rows:
+            return await ctx.reply(
+                embed=h.base_embed(
+                    description=f"Aucun rôle dans le menu.\n"
+                                f'`{ctx.prefix}addrolecS "Mon rôle"` pour en ajouter.'
+                )
+            )
+        lignes = []
+        for r in rows:
+            role = ctx.guild.get_role(r["role_id"])
+            if role is None:
+                continue
+            emoji = f"{r['emoji']} " if r["emoji"] else ""
+            desc = f" — *{h.clean(r['description'], 60)}*" if r["description"] else ""
+            lignes.append(f"• {emoji}{role.mention}{desc}")
+        panel = await self.bot.db.selfrole_panel(ctx.guild.id)
+        mode = "multiple" if panel["multiple"] else "unique"
+        e = h.base_embed(f"Menu de rôles ({len(lignes)})", "\n".join(lignes))
+        e.set_footer(text=f"Mode : {mode} · {ctx.prefix}rolepanel pour publier")
+        await ctx.reply(embed=e)
+
+    # ------------------------------------------------------------ panneau
+
+    @commands.group(
+        name="rolepanel",
+        aliases=["panelrole", "menurole"],
+        invoke_without_command=True,
+        help="-rolepanel [#salon] — publie le menu de sélection de rôle.",
+    )
+    @commands.guild_only()
+    @h.is_owner_or(manage_roles=True)
+    async def rolepanel(self, ctx, salon: discord.TextChannel = None):
+        salon = salon or ctx.channel
+        rows = await self.bot.db.selfroles(ctx.guild.id)
+        if not rows:
+            return await ctx.reply(
+                embed=h.warn_embed(
+                    f"Ajoute d'abord des rôles :\n"
+                    f'`{ctx.prefix}addrolecS "Mon rôle" 🎮 Une description`'
+                )
+            )
+        panel = await self.bot.db.selfrole_panel(ctx.guild.id)
+        message = await self._publier(ctx.guild, salon, panel, rows)
+        if message is None:
+            return await ctx.reply(
+                embed=h.err_embed("Tous les rôles enregistrés ont été supprimés.")
+            )
+        await self.bot.db.set_selfrole_panel(ctx.guild.id, "channel_id", salon.id)
+        await self.bot.db.set_selfrole_panel(ctx.guild.id, "message_id", message.id)
+        if salon != ctx.channel:
+            await ctx.reply(embed=h.ok_embed(f"Menu publié dans {salon.mention}."))
+
+    @rolepanel.command(name="titre", aliases=["title"])
+    @h.is_owner_or(manage_roles=True)
+    async def rp_titre(self, ctx, *, texte: str):
+        await self.bot.db.set_selfrole_panel(ctx.guild.id, "title", texte[:250])
+        await ctx.reply(embed=h.ok_embed("Titre enregistré."))
+        await self._auto_refresh(ctx.guild)
+
+    @rolepanel.command(name="texte", aliases=["description", "desc"])
+    @h.is_owner_or(manage_roles=True)
+    async def rp_texte(self, ctx, *, texte: str):
+        await self.bot.db.set_selfrole_panel(ctx.guild.id, "description", texte[:3000])
+        await ctx.reply(embed=h.ok_embed("Description enregistrée."))
+        await self._auto_refresh(ctx.guild)
+
+    @rolepanel.command(name="placeholder", aliases=["ph"])
+    @h.is_owner_or(manage_roles=True)
+    async def rp_placeholder(self, ctx, *, texte: str):
+        await self.bot.db.set_selfrole_panel(ctx.guild.id, "placeholder", texte[:100])
+        await ctx.reply(embed=h.ok_embed(f"Texte du menu : **{h.clean(texte, 100)}**"))
+        await self._auto_refresh(ctx.guild)
+
+    @rolepanel.command(name="mode")
+    @h.is_owner_or(manage_roles=True)
+    async def rp_mode(self, ctx, mode: str):
+        multiple = mode.lower() in ("multiple", "plusieurs", "multi")
+        await self.bot.db.set_selfrole_panel(ctx.guild.id, "multiple", int(multiple))
+        await ctx.reply(
+            embed=h.ok_embed(
+                "Mode **multiple** : un membre peut cumuler plusieurs rôles."
+                if multiple else
+                "Mode **unique** : le nouveau rôle remplace l'ancien."
+            )
+        )
+        await self._auto_refresh(ctx.guild)
+
+    @rolepanel.command(name="refresh", aliases=["maj", "update"])
+    @h.is_owner_or(manage_roles=True)
+    async def rp_refresh(self, ctx):
+        if await self._auto_refresh(ctx.guild):
+            await ctx.reply(embed=h.ok_embed("Menu mis à jour."))
+        else:
+            await ctx.reply(
+                embed=h.warn_embed(
+                    f"Aucun menu publié à mettre à jour — lance `{ctx.prefix}rolepanel`."
+                )
+            )
+
+    async def _auto_refresh(self, guild) -> bool:
+        """Réécrit le message du menu déjà publié, s'il existe encore."""
+        panel = await self.bot.db.selfrole_panel(guild.id)
+        if not panel or not panel["channel_id"] or not panel["message_id"]:
+            return False
+        salon = guild.get_channel(panel["channel_id"])
+        if salon is None:
+            return False
+        try:
+            message = await salon.fetch_message(panel["message_id"])
+        except discord.HTTPException:
+            return False
+        rows = await self.bot.db.selfroles(guild.id)
+        options = construire_options(guild, rows, bool(panel["multiple"]))
+        if not options:
+            try:
+                await message.delete()
+            except discord.HTTPException:
+                pass
+            await self.bot.db.set_selfrole_panel(guild.id, "message_id", None)
+            return False
+        vue = SelfRolePanelView(
+            self.bot, options, bool(panel["multiple"]), panel["placeholder"]
+        )
+        try:
+            await message.edit(embed=self._panel_embed(guild, panel), view=vue)
+        except discord.HTTPException:
+            return False
+        return True
+
+    # ------------------------------------------------------------ entretien
+
+    @commands.Cog.listener()
+    async def on_guild_role_delete(self, role: discord.Role):
+        """Un rôle supprimé disparaît aussi du menu."""
+        try:
+            await self.bot.db.remove_selfrole(role.guild.id, role.id)
+        except Exception:
+            return
+        await self._auto_refresh(role.guild)
+
+
 # ==============================================================================
 #  SECTION 23 - BOT CLASS & ENTRY POINT
 # ==============================================================================
@@ -9015,7 +9539,7 @@ class MyBot(commands.Bot):
         log.info("Database ready at %s", config.DB_PATH)
 
         for cog in (Moderation, AntiRaid, Tickets, Welcome,
-                    Stats, Fun, OpMod, Tools, VoiceStats, Extras, HardBan, Rules, StatsChannels, Logging, MediaOnly, Panel, TempVoice, Scheduler, Utility):
+                    Stats, Fun, OpMod, Tools, VoiceStats, Extras, HardBan, Rules, StatsChannels, Logging, MediaOnly, Panel, TempVoice, SelfRoles, Scheduler, Utility):
             try:
                 await self.add_cog(cog(self))
                 log.info("Loaded %s", cog.__name__)
@@ -9030,6 +9554,7 @@ class MyBot(commands.Bot):
             self.add_view(VoicePanelView(self))
             self.add_view(PanelView(self))
             self.add_view(RulesView(self))
+            self.add_view(SelfRolePanelView(self))
             self.persistent_views_added = True
 
     async def close(self):
@@ -9042,8 +9567,8 @@ class MyBot(commands.Bot):
         log.info("Serving %d guild(s), %d users", len(self.guilds),
                  sum(g.member_count or 0 for g in self.guilds))
         await self.change_presence(
-            activity=discord.Activité(
-                type=discord.ActivitéType.watching,
+            activity=discord.Activity(
+                type=discord.ActivityType.watching,
                 name=f"{config.PREFIX}help | {len(self.guilds)} servers",
             )
         )
