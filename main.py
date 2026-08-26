@@ -4072,7 +4072,7 @@ class Fun(commands.Cog):
 
     # ================================================================ claim
 
-        @commands.command(
+    @commands.command(
         name="ls",
         aliases=["claim", "collar"],
         help="-ls @user <label> — Verrouille un membre en vocal et le renomme de force.",
