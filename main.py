@@ -4186,38 +4186,7 @@ class Fun(commands.Cog):
         await ctx.reply(embed=h.ok_embed(f"**{target.display_name}** libéré."),
                         mention_author=False
                        )
-      
-    @commands.command(name="uncollar", aliases=["unclaim", "release"],
-                      help="Annuler ton propre pseudo, ou libérer quelqu'un que tu as réclamé.")
-    @commands.guild_only()
-    @commands.bot_has_permissions(manage_nicknames=True)
-    async def uncollar(self, ctx, member: discord.Member = None):
-        target = member or ctx.author
-        row = await self.bot.db.get_collar(ctx.guild.id, target.id)
-        if not row:
-            return await ctx.reply(embed=h.warn_embed("Aucune réclamation active sur ce membre."),
-                                   mention_author=False)
 
-        # Who's allowed to undo: the person themselves, the claimer, or staff.
-        allowed = (
-            ctx.author.id == target.id
-            or ctx.author.id == row["owner_id"]
-            or ctx.author.guild_permissions.manage_nicknames
-        )
-        if not allowed:
-            return await ctx.reply(
-                embed=h.err_embed("Seuls l'intéressé, la personne qui l'a réclamé ou le staff "
-                                  "peuvent annuler ça."),
-                mention_author=False,
-            )
-
-        try:
-            await target.edit(nick=row["old_nick"], reason=f"Claim released by {ctx.author}")
-        except discord.Forbidden:
-            pass
-        await self.bot.db.remove_collar(ctx.guild.id, target.id)
-        await ctx.reply(embed=h.ok_embed(f"**{target.display_name}** libéré."),
-                        mention_author=False)
 
     @commands.command(name="claims", help="Lister tous ceux qui ont accepté ta réclamation.")
     @commands.guild_only()
