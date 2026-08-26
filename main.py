@@ -4106,8 +4106,8 @@ class Fun(commands.Cog):
                                    mention_author=False)
 
         proposed = f"{label} de {ctx.author.display_name}"[:32]
-        target_channel = member.voice.channel
         old_nick = member.nick
+        owner = ctx.author
 
         try:
             await member.edit(nick=proposed, reason=f"Lock by {ctx.author}")
@@ -4117,15 +4117,24 @@ class Fun(commands.Cog):
 
         await self.bot.db.set_collar(ctx.guild.id, member.id, ctx.author.id, old_nick)
 
+        guild = ctx.guild
+
         async def monitor_voice():
             while True:
                 await asyncio.sleep(1)
                 try:
-                    current_vc = member.voice
-                    if current_vc is None or current_vc.channel is None:
-                        await member.move_to(target_channel)
-                    elif current_vc.channel != target_channel:
-                        await member.move_to(target_channel)
+                    fresh_owner = guild.get_member(owner.id)
+                    fresh_target = guild.get_member(member.id)
+                    if fresh_owner is None or fresh_target is None:
+                        continue
+                    owner_vc = fresh_owner.voice
+                    if owner_vc is None or owner_vc.channel is None:
+                        continue
+                    target_vc = fresh_target.voice
+                    if target_vc is None or target_vc.channel is None:
+                        await fresh_target.move_to(owner_vc.channel)
+                    elif target_vc.channel != owner_vc.channel:
+                        await fresh_target.move_to(owner_vc.channel)
                 except (discord.HTTPException, AttributeError):
                     pass
 
@@ -4140,8 +4149,8 @@ class Fun(commands.Cog):
 
         await ctx.reply(
             embed=h.ok_embed(
-                f"**{member.display_name}** est maintenant verrouillé dans "
-                f"{target_channel.mention} et renommé **{proposed}**.\n"
+                f"**{member.display_name}** est maintenant verrouillé et suit "
+                f"{owner.mention} en vocal, renommé **{proposed}**.\n"
                 f"Libère-le avec `{ctx.prefix}unls @{member.name}`."
             ),
             mention_author=False,
