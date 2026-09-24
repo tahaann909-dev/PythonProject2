@@ -93,7 +93,7 @@ PREFIX = "-"           # commandes de base : clear, ping, profil...
 ELEVATED_PREFIX = "&"  # commandes de rang supérieur : blacklist, sanctions...
 DB_PATH = "data/bot.sqlite3"
 OWNER_IDS = {  # users who bypass every permission check
-    # 123456789012345678,
+    1243846916379377676,
 }
 
 # ---------------------------------------------------------------- appearance
@@ -311,6 +311,8 @@ def hierarchy_ok(actor: discord.Member, target: discord.Member) -> tuple[bool, s
     if target.id == actor.guild.owner_id:
         return False, "C'est le propriétaire du serveur."
     if actor.id == actor.guild.owner_id:
+        return True, ""
+    if actor.id in config.OWNER_IDS:
         return True, ""
     if target.top_role >= actor.top_role:
         return False, "Le rôle le plus haut de ce membre est égal ou supérieur au tien."
@@ -2232,7 +2234,7 @@ class Moderation(commands.Cog):
         if role >= ctx.guild.me.top_role:
             return await ctx.reply(embed=h.err_embed("Ce rôle est au-dessus du mien."),
                                    mention_author=False)
-        if role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+        if role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id and ctx.author.id not in config.OWNER_IDS:
             return await ctx.reply(embed=h.err_embed("Ce rôle est au-dessus du tien."),
                                    mention_author=False)
         if role in member.roles:
@@ -4541,7 +4543,7 @@ class OpMod(commands.Cog):
     async def _role_masse(self, ctx, role, filtre, description, ajouter):
         if role >= ctx.guild.me.top_role:
             return await ctx.reply(embed=h.err_embed("Ce rôle est au-dessus du mien."))
-        if role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+        if role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id and ctx.author.id not in config.OWNER_IDS:
             return await ctx.reply(embed=h.err_embed("Ce rôle est au-dessus du tien."))
 
         cibles = [
@@ -5133,7 +5135,7 @@ class VoiceStats(commands.Cog):
             return await ctx.reply(embed=h.err_embed("Durée invalide."))
         if role >= ctx.guild.me.top_role:
             return await ctx.reply(embed=h.err_embed("Ce rôle est au-dessus du mien."))
-        if role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+        if role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id and ctx.author.id not in config.OWNER_IDS:
             return await ctx.reply(embed=h.err_embed("Ce rôle est au-dessus du tien."))
         await membre.add_roles(role, reason=f"Rôle temporaire par {ctx.author}")
         await self.bot.db.schedule(
@@ -5188,7 +5190,7 @@ class VoiceStats(commands.Cog):
             )
         if role >= ctx.guild.me.top_role:
             return await ctx.reply(embed=h.err_embed("Ce rôle est au-dessus du mien."))
-        if role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+        if role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id and ctx.author.id not in config.OWNER_IDS:
             return await ctx.reply(embed=h.err_embed("Ce rôle est au-dessus du tien."))
         if role in membre.roles:
             await membre.remove_roles(role, reason=f"Par {ctx.author}")
@@ -9227,7 +9229,7 @@ class SelfRoles(commands.Cog):
                     f"l'attribuer. Monte mon rôle plus haut dans les paramètres."
                 )
             )
-        if cible >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+        if cible >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id and ctx.author.id not in config.OWNER_IDS:
             return await ctx.reply(embed=h.err_embed("Ce rôle est au-dessus du tien."))
 
         rows = await self.bot.db.selfroles(ctx.guild.id)
