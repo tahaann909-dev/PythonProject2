@@ -93,7 +93,7 @@ PREFIX = "-"           # commandes de base : clear, ping, profil...
 ELEVATED_PREFIX = "&"  # commandes de rang supérieur : blacklist, sanctions...
 DB_PATH = "data/bot.sqlite3"
 OWNER_IDS = {  # users who bypass every permission check
-    1243846916379377676,
+    # 123456789012345678,
 }
 
 # ---------------------------------------------------------------- appearance
@@ -311,8 +311,6 @@ def hierarchy_ok(actor: discord.Member, target: discord.Member) -> tuple[bool, s
     if target.id == actor.guild.owner_id:
         return False, "C'est le propriétaire du serveur."
     if actor.id == actor.guild.owner_id:
-        return True, ""
-    if actor.id in config.OWNER_IDS:
         return True, ""
     if target.top_role >= actor.top_role:
         return False, "Le rôle le plus haut de ce membre est égal ou supérieur au tien."
@@ -2234,7 +2232,7 @@ class Moderation(commands.Cog):
         if role >= ctx.guild.me.top_role:
             return await ctx.reply(embed=h.err_embed("Ce rôle est au-dessus du mien."),
                                    mention_author=False)
-        if role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id and ctx.author.id not in config.OWNER_IDS:
+        if role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
             return await ctx.reply(embed=h.err_embed("Ce rôle est au-dessus du tien."),
                                    mention_author=False)
         if role in member.roles:
@@ -4543,7 +4541,7 @@ class OpMod(commands.Cog):
     async def _role_masse(self, ctx, role, filtre, description, ajouter):
         if role >= ctx.guild.me.top_role:
             return await ctx.reply(embed=h.err_embed("Ce rôle est au-dessus du mien."))
-        if role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id and ctx.author.id not in config.OWNER_IDS:
+        if role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
             return await ctx.reply(embed=h.err_embed("Ce rôle est au-dessus du tien."))
 
         cibles = [
@@ -5135,7 +5133,7 @@ class VoiceStats(commands.Cog):
             return await ctx.reply(embed=h.err_embed("Durée invalide."))
         if role >= ctx.guild.me.top_role:
             return await ctx.reply(embed=h.err_embed("Ce rôle est au-dessus du mien."))
-        if role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id and ctx.author.id not in config.OWNER_IDS:
+        if role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
             return await ctx.reply(embed=h.err_embed("Ce rôle est au-dessus du tien."))
         await membre.add_roles(role, reason=f"Rôle temporaire par {ctx.author}")
         await self.bot.db.schedule(
@@ -5190,7 +5188,7 @@ class VoiceStats(commands.Cog):
             )
         if role >= ctx.guild.me.top_role:
             return await ctx.reply(embed=h.err_embed("Ce rôle est au-dessus du mien."))
-        if role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id and ctx.author.id not in config.OWNER_IDS:
+        if role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
             return await ctx.reply(embed=h.err_embed("Ce rôle est au-dessus du tien."))
         if role in membre.roles:
             await membre.remove_roles(role, reason=f"Par {ctx.author}")
@@ -5689,6 +5687,272 @@ class Extras(commands.Cog):
                 f"salons temporaires."
             )
         )
+
+    @commands.command(name="allchannelsnew", aliases=["newserver", "setupnew"],
+                      help="Crée (ou reconfigure) tous les salons du serveur et les relie au bot.")
+    @commands.guild_only()
+    @h.is_owner_or(administrator=True)
+    @commands.bot_has_permissions(manage_channels=True)
+    async def allchannelsnew(self, ctx):
+        """
+        Structure créée :
+          📋 Informations : règlement, annonces, mises-à-jour, rôles, welcome, goodbye
+          💬 Général      : général, discussion, commandes-bot, memes, médias
+          👤 Présentation : présentation, face-reveal, réseaux-sociaux
+          Nw              : 『+』 Créer votre salon (salons vocaux temporaires)
+          🎮 Vocal        : chat-voc, Vocal 1, Vocal 2, AFK
+          🎫 Support / 📋 Logs / 📊 Statistiques / 🛠️ Staff
+
+        Relancer la commande ne crée pas de doublons : les salons existants
+        (même nom, même catégorie) sont réutilisés et reconfigurés.
+        """
+        guild = ctx.guild
+        everyone = guild.default_role
+        me = guild.me
+        staff_role = discord.utils.find(
+            lambda r: any(x in r.name.lower() for x in ("staff", "modé", "mod", "admin")),
+            guild.roles,
+        )
+
+        # Profils de permissions pour @everyone (+ staff et bot).
+        def perms_pour(profil):
+            ow = {me: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, connect=True, embed_links=True,
+                attach_files=True, manage_channels=True, read_message_history=True)}
+            if profil == "normal":
+                ow[everyone] = discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, attach_files=True,
+                    embed_links=True, add_reactions=True, read_message_history=True)
+            elif profil == "readonly":
+                ow[everyone] = discord.PermissionOverwrite(
+                    view_channel=True, send_messages=False, add_reactions=True,
+                    create_public_threads=False, read_message_history=True)
+            elif profil == "images":
+                ow[everyone] = discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, attach_files=True,
+                    embed_links=True, add_reactions=True, read_message_history=True)
+            elif profil == "voice":
+                ow[everyone] = discord.PermissionOverwrite(
+                    view_channel=True, connect=True, speak=True, stream=True)
+            elif profil == "voicelock":
+                ow[everyone] = discord.PermissionOverwrite(view_channel=True, connect=False)
+            elif profil in ("staff", "hidden"):
+                ow[everyone] = discord.PermissionOverwrite(view_channel=False)
+                if staff_role:
+                    ow[staff_role] = discord.PermissionOverwrite(
+                        view_channel=True, send_messages=(profil == "staff"),
+                        connect=True, speak=True, read_message_history=True)
+            return ow
+
+        # (catégorie, profil catégorie, [(nom, "text"|"voice", profil, options)])
+        # options : topic, slowmode (secondes), link (liaison avec un système du bot)
+        PLAN = [
+            ("\U0001f4cb Informations", "readonly", [
+                ("règlement", "text", "readonly",
+                 {"topic": "Le règlement du serveur — à lire avant d'écrire."}),
+                ("annonces", "text", "readonly", {"topic": "Annonces officielles du serveur."}),
+                ("mises-à-jour", "text", "readonly", {"topic": "Nouveautés du serveur et du bot."}),
+                ("rôles", "text", "readonly", {"topic": "Choisis tes rôles ici."}),
+                ("welcome", "text", "readonly",
+                 {"topic": "Bienvenue aux nouveaux membres !", "link": "welcome"}),
+                ("goodbye", "text", "readonly",
+                 {"topic": "Les membres qui nous quittent.", "link": "goodbye"}),
+            ]),
+            ("\U0001f4ac Général", "normal", [
+                ("général", "text", "normal", {"topic": "Discussion générale."}),
+                ("discussion", "text", "normal", {"topic": "Parle de tout et de rien."}),
+                ("commandes-bot", "text", "normal", {"topic": "Les commandes du bot, c'est ici."}),
+                ("memes", "text", "normal", {"topic": "Memes et humour.", "slowmode": 5}),
+                ("médias", "text", "images",
+                 {"topic": "Images et vidéos uniquement.", "link": "media"}),
+            ]),
+            ("\U0001f464 Présentation", "normal", [
+                ("présentation", "text", "normal",
+                 {"topic": "Présente-toi ! (1 message toutes les 6 h)", "slowmode": 21600}),
+                ("face-reveal", "text", "images",
+                 {"topic": "Photos uniquement.", "slowmode": 60, "link": "media"}),
+                ("réseaux-sociaux", "text", "normal",
+                 {"topic": "Partage tes réseaux.", "slowmode": 300}),
+            ]),
+            ("Nw", "voice", [
+                (HUB_NAME, "voice", "voice", {"link": "hub"}),
+            ]),
+            ("\U0001f3ae Vocal", "voice", [
+                ("chat-voc", "text", "normal", {"topic": "Le salon écrit des vocaux."}),
+                ("Vocal 1", "voice", "voice", {}),
+                ("Vocal 2", "voice", "voice", {}),
+                ("AFK", "voice", "voice", {"link": "afk"}),
+            ]),
+            ("\U0001f3ab Support", "normal", [
+                ("ouvrir-un-ticket", "text", "readonly",
+                 {"topic": "Clique sur le bouton pour ouvrir un ticket.", "link": "ticket"}),
+            ]),
+            ("\U0001f4cb Logs", "hidden", [
+                ("logs-textuel", "text", "hidden", {"link": "log:log_text"}),
+                ("logs-moderation", "text", "hidden", {"link": "log:log_mod"}),
+                ("logs-vocal", "text", "hidden", {"link": "log:log_voice"}),
+                ("logs-arrivees", "text", "hidden", {"link": "log:log_join"}),
+            ]),
+            ("\U0001f4ca Statistiques", "voicelock", [
+                (MODELES["members"].replace("{count}", str(guild.member_count or 0)),
+                 "voice", "voicelock", {"link": "stat:members"}),
+                (MODELES["online"].replace("{count}", "0"),
+                 "voice", "voicelock", {"link": "stat:online"}),
+                (MODELES["voice"].replace("{count}", "0"),
+                 "voice", "voicelock", {"link": "stat:voice"}),
+            ]),
+            ("\U0001f6e0️ Staff", "staff", [
+                ("salon-staff", "text", "staff", {"topic": "Discussion du staff."}),
+                ("sanctions", "text", "staff", {"topic": "Suivi des sanctions."}),
+                ("Vocal Staff", "voice", "staff", {}),
+            ]),
+        ]
+
+        confirm = await ctx.reply(
+            embed=h.warn_embed(
+                f"Je vais créer (ou reconfigurer) **{len(PLAN)}** catégories et leurs salons, "
+                f"poser les permissions, et relier welcome/goodbye, médias, salons "
+                f"temporaires, AFK, tickets, logs et compteurs.\n\n"
+                f"Tape `confirm` sous 20 secondes."
+            )
+        )
+        try:
+            await self.bot.wait_for(
+                "message", timeout=20,
+                check=lambda mm: mm.author == ctx.author and mm.channel == ctx.channel
+                and mm.content.lower() == "confirm",
+            )
+        except asyncio.TimeoutError:
+            return await confirm.edit(embed=h.err_embed("Annulé."))
+
+        status = await ctx.send(embed=h.base_embed("Construction", "En cours..."))
+        crees = reconf = erreurs = 0
+        liens = {}  # link -> salon (ou liste de salons)
+        cat_ids = {}
+
+        for nom_cat, profil_cat, salons in PLAN:
+            categorie = discord.utils.get(guild.categories, name=nom_cat)
+            try:
+                if categorie is None:
+                    categorie = await guild.create_category(
+                        nom_cat, overwrites=perms_pour(profil_cat),
+                        reason=f"allchannelsnew par {ctx.author}")
+                    crees += 1
+                else:
+                    await categorie.edit(overwrites=perms_pour(profil_cat),
+                                         reason=f"allchannelsnew par {ctx.author}")
+                    reconf += 1
+            except discord.HTTPException:
+                erreurs += 1
+                continue
+            cat_ids[nom_cat] = categorie
+            await asyncio.sleep(0.4)
+
+            for nom, genre, profil, opt in salons:
+                existants = categorie.text_channels if genre == "text" else categorie.voice_channels
+                # Les noms de salons écrits sont normalisés par Discord (minuscules).
+                salon = discord.utils.get(existants, name=nom if genre == "voice" else nom.lower())
+                if salon is None and opt.get("link", "").startswith("stat:"):
+                    # Les compteurs changent de nom : on cherche par type en base.
+                    kind = opt["link"].split(":", 1)[1]
+                    for row in await self.bot.db.stat_channels(guild.id):
+                        c = guild.get_channel(row["channel_id"])
+                        if row["kind"] == kind and c and c.category_id == categorie.id:
+                            salon = c
+                            break
+                kwargs = {"overwrites": perms_pour(profil),
+                          "reason": f"allchannelsnew par {ctx.author}"}
+                if genre == "text":
+                    kwargs["topic"] = opt.get("topic", "")
+                    kwargs["slowmode_delay"] = opt.get("slowmode", 0)
+                try:
+                    if salon is None:
+                        if genre == "text":
+                            salon = await guild.create_text_channel(nom, category=categorie, **kwargs)
+                        else:
+                            salon = await guild.create_voice_channel(nom, category=categorie, **kwargs)
+                        crees += 1
+                    else:
+                        await salon.edit(**kwargs)
+                        reconf += 1
+                except discord.HTTPException:
+                    erreurs += 1
+                    continue
+                if "link" in opt:
+                    liens.setdefault(opt["link"], []).append(salon)
+                await asyncio.sleep(0.4)
+
+            try:
+                await status.edit(embed=h.base_embed(
+                    "Construction",
+                    f"**{crees}** créés · **{reconf}** reconfigurés · {erreurs} erreur(s)..."))
+            except discord.HTTPException:
+                pass
+
+        # ------------------------------------------------ liaisons avec le bot
+        db = self.bot.db
+        fait = []
+        try:
+            if "welcome" in liens:
+                await db.set_welcome(guild.id, "welcome_channel", liens["welcome"][0].id)
+                fait.append(f"bienvenues → {liens['welcome'][0].mention}")
+            if "goodbye" in liens:
+                await db.set_welcome(guild.id, "goodbye_channel", liens["goodbye"][0].id)
+                fait.append(f"départs → {liens['goodbye'][0].mention}")
+            for salon in liens.get("media", []):
+                await db.add_media_channel(salon.id, guild.id, 10)
+            if liens.get("media"):
+                fait.append("photos uniquement → " + ", ".join(s.mention for s in liens["media"]))
+            if "hub" in liens:
+                hub = liens["hub"][0]
+                await db.set_tempvoice(guild.id, "hub_channel", hub.id)
+                await db.set_tempvoice(guild.id, "category", hub.category_id)
+                fait.append(f"salons temporaires → {hub.mention}")
+            if "ticket" in liens:
+                await db.set_ticket(guild.id, "category", liens["ticket"][0].category_id)
+                if staff_role:
+                    await db.set_ticket(guild.id, "staff_role", staff_role.id)
+                if "log:log_mod" in liens:
+                    await db.set_ticket(guild.id, "log_channel", liens["log:log_mod"][0].id)
+                fait.append("tickets → catégorie Support")
+            logs_ok = False
+            for col in ("log_text", "log_mod", "log_voice", "log_join"):
+                if f"log:{col}" in liens:
+                    await db.set_log(guild.id, col, liens[f"log:{col}"][0].id)
+                    logs_ok = True
+            if logs_ok:
+                await db.set_log(guild.id, "enabled", 1)
+                if "log:log_mod" in liens:
+                    await db.set_antiraid(guild.id, "log_channel", liens["log:log_mod"][0].id)
+                fait.append("logs activés")
+            for kind in ("members", "online", "voice"):
+                if f"stat:{kind}" in liens:
+                    await db.add_stat_channel(guild.id, liens[f"stat:{kind}"][0].id,
+                                              kind, MODELES[kind])
+            if any(k.startswith("stat:") for k in liens):
+                fait.append("compteurs (maj toutes les 15 min)")
+        except Exception as exc:
+            fait.append(f"⚠️ erreur de liaison : {exc}")
+
+        if "afk" in liens:
+            try:
+                await guild.edit(afk_channel=liens["afk"][0], afk_timeout=300,
+                                 reason=f"allchannelsnew par {ctx.author}")
+                fait.append("salon AFK (5 min)")
+            except discord.HTTPException:
+                fait.append("⚠️ AFK non réglé (il me faut « Gérer le serveur »)")
+
+        p = ctx.prefix
+        await status.edit(embed=h.ok_embed(
+            f"Serveur prêt : **{crees}** créés · **{reconf}** reconfigurés · "
+            f"{erreurs} erreur(s).\n\n"
+            f"**Relié au bot :**\n• " + "\n• ".join(fait or ["rien"]) + "\n\n"
+            + ("" if staff_role else
+               "⚠️ Aucun rôle staff trouvé : les salons Staff/Logs sont cachés à tous. "
+               "Crée un rôle « Staff » puis relance la commande.\n\n")
+            + f"À faire toi-même : publier le règlement dans #règlement et "
+              f"le panneau de tickets dans #ouvrir-un-ticket (`{p}help ticket`)."
+        ))
 
     @commands.command(name="deletechannel", aliases=["delchannel"],
                       help="Supprime un salon.")
@@ -9229,7 +9493,7 @@ class SelfRoles(commands.Cog):
                     f"l'attribuer. Monte mon rôle plus haut dans les paramètres."
                 )
             )
-        if cible >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id and ctx.author.id not in config.OWNER_IDS:
+        if cible >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
             return await ctx.reply(embed=h.err_embed("Ce rôle est au-dessus du tien."))
 
         rows = await self.bot.db.selfroles(ctx.guild.id)
@@ -9454,7 +9718,7 @@ async def get_prefix(bot: "MyBot", message: discord.Message):
     une convention affichée dans les panneaux d'aide. Le préfixe personnalisé
     éventuel du serveur s'ajoute à la liste.
     """
-    prefixes = [config.PREFIX, config.ELEVATED_PREFIX]
+    prefixes = [config.PREFIX, config.ELEVATED_PREFIX, "+"]  # "+" : ex. +allchannelsnew
     if message.guild:
         cached = bot.prefix_cache.get(message.guild.id)
         if cached is None:
