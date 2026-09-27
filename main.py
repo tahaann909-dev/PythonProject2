@@ -29,6 +29,8 @@
    * Welcome     : join & leave messages, placeholders, autorole, DM welcome
    * Stats       : -u profile card, leaderboards, achievements
    * Fun         : consent-gated claim, 8ball, ship, poll, roll, remind
+   * Panneau     : -panel, toutes les commandes par catégorie + recherche
+   * Candidatures: +cand, formulaires Staff / Helper avec accepter / refuser
    * Scheduler   : temp bans/mutes expire correctly even after a restart
 
   NOTE ON  -ls
@@ -2946,7 +2948,7 @@ class TicketControlView(discord.ui.View):
         if ticket and ticket["claimed_by"]:
             who = interaction.guild.get_member(ticket["claimed_by"])
             return await interaction.response.send_message(
-                embed=h.warn_embed(f"Déjà pris en charge par {who.mention if who else 'quelqu\'un'}."),
+                embed=h.warn_embed(f"Déjà pris en charge par {who.mention if who else 'quelqu’un'}."),
                 ephemeral=True,
             )
         await bot.db.claim_ticket(interaction.channel.id, interaction.user.id)
@@ -8050,141 +8052,577 @@ class Tools(commands.Cog):
 
 # ==============================================================================
 #  SECTION 19 - PANNEAU DE COMMANDES
+#  Le panneau est généré à partir des vraies commandes du bot : une commande
+#  ajoutée plus tard apparaît toute seule (dans « Autres » si elle n'est pas
+#  classée ci-dessous).
 # ==============================================================================
 
+PANEL_COLOR = 0x2B2D31     # se fond dans le thème sombre de Discord
+PANEL_PAGE_SIZE = 6        # commandes par page
 
+# (clé, nom affiché, description courte, préfixe affiché, commandes racines)
+PANEL_CATEGORIES = [
+    ("moderation", "Modération", "Sanctions, nettoyage et contrôle des salons", "-", [
+        "ban", "tempban", "softban", "unban", "kick", "mute", "unmute", "warn",
+        "jail", "unjail", "emprisonné", "jailsetup", "massban", "masskick",
+        "banlist", "purge", "slowmode", "slowmodeall", "lock", "unlock", "nuke",
+        "nick", "nickall", "resetnicks",
+    ]),
+    ("casier", "Casier & surveillance", "Historique, notes internes et journaux", "&", [
+        "cases", "delcase", "clearwarns", "note", "notes", "delnote", "snipe",
+        "editsnipe", "modstats", "auditlog", "invites", "delinvite",
+    ]),
+    ("securite", "Sécurité", "Anti-raid, hardban, blacklist et verrouillage", "&", [
+        "antiraid", "lockdown", "closeall", "openall", "hardban", "unhardban",
+        "hardbans", "hardbanconfig", "botblacklist", "unbotbl", "botblinfo",
+        "whitelist", "verifylevel", "mediaonly",
+    ]),
+    ("roles", "Rôles", "Attribution, création et menu de rôles", "&", [
+        "role", "setrole", "temprole", "roleall", "rolehumans", "rolebots",
+        "removeroleall", "autorole", "createrole", "deleterole", "rolecolor",
+        "rolename", "hoist", "mentionable", "roleicon", "roles", "roleinfo",
+        "inrole", "addrolecs", "delrolecs", "listrolecs", "rolepanel",
+    ]),
+    ("salons", "Salons", "Création, gestion et compteurs de salons", "&", [
+        "createchannel", "createvoice", "createcategory", "allchannelcreate",
+        "allchannelsnew", "deletechannel", "renamechannel", "settopic", "nsfw",
+        "hidechannel", "showchannel", "clone", "pin", "unpin", "unpinall",
+        "channelinfo", "firstmessage", "statschannels",
+    ]),
+    ("vocal", "Vocal", "Contrôle des salons vocaux et salons temporaires", "-", [
+        "move", "vcmove", "summon", "followme", "moveall", "voicekick",
+        "voicemute", "voiceunmute", "deafen", "muteall", "unmuteall",
+        "disconnectall", "vclock", "vcunlock", "vclimit", "vc", "vcusers",
+        "voice", "vcpanneau",
+    ]),
+    ("messages", "Messages & annonces", "Annonces, messages privés et embeds", "&", [
+        "announce", "embed", "say", "echo", "dm", "msg", "dmall", "rep",
+        "editmsg", "react", "clearreactions", "sticky", "tag", "suggest",
+    ]),
+    ("config", "Configuration", "Mise en place du bot et des systèmes", "&", [
+        "setup", "permcheck", "setprefix", "setmodlog", "logs", "setlogs",
+        "welcome", "goodbye", "rules", "rule2", "ticket", "cand", "panel",
+    ]),
+    ("infos", "Infos & profils", "Profils, statistiques et informations", "-", [
+        "help", "u", "leaderboard", "serverinfo", "membercount", "newmembers",
+        "boosters", "avatar", "banner", "servericon", "perms", "emojis",
+        "emojiinfo", "ping", "botinfo", "uptime", "invite",
+    ]),
+    ("outils", "Outils", "Utilitaires, sondages, concours et émojis", "-", [
+        "afk", "remind", "timestamp", "calc", "color", "base64", "poll",
+        "poll2", "poll3", "giveaway", "stealemoji", "addemoji", "delemoji",
+        "renameemoji", "enlarge",
+    ]),
+    ("fun", "Fun", "Jeux et commandes détente", "-", [
+        "8ball", "ship", "roast", "compliment", "roll", "coinflip", "choose",
+        "reverse", "mock", "clap", "espace", "ls", "unls", "claims",
+    ]),
+]
+PANEL_OTHER = ("autres", "Autres", "Commandes non classées", "-")
 
+# Préfixe affiché pour certaines commandes précises.
+PANEL_PREFIX_OVERRIDE = {"cand": "+", "allchannelsnew": "+"}
 
-B = config.PREFIX
-E = config.ELEVATED_PREFIX
-
-FICHES = {
-    "Modération": ("\U0001f528", B, [
-        (f"{B}ban <@user|ID> [durée] [raison]", "Bannit un membre"),
-        (f"{B}tempban <@user> <durée> <raison>", "Ban temporaire auto"),
-        (f"{B}kick <@user> [raison]", "Expulse un membre"),
-        (f"{B}softban <@user> [raison]", "Ban + unban (purge messages)"),
-        (f"{B}tempmute <@user|ID> [durée]", "Rend un membre muet"),
-        (f"{B}unmute <@user|ID>", "Retire le mute"),
-        (f"{B}unmuteall", "Retire les mutes de tout le monde"),
-        (f"{B}warn <@user|ID> <raison>", "Ajoute un avertissement"),
-        (f"{B}clear <nombre|all>", "Supprime des messages"),
-        (f"{B}lock / {B}unlock", "Bloque / rouvre le salon"),
-        (f"{B}slowmode <temps>", "Active le mode lent"),
-        (f"{B}jail <@user> [durée]", "Emprisonne un membre"),
-    ]),
-    "Surveillance & Infos": ("\U0001f50e", B, [
-        (f"{B}history <@user|ID>", "Dossier du membre (casier)"),
-        (f"{B}user <@user|ID>", "Infos détaillées"),
-        (f"{B}pic <@user|ID>", "Photo de profil (pp)"),
-        (f"{B}banner", "Bannière du serveur"),
-        (f"{B}snipe", "Dernier message supprimé"),
-        (f"{B}editsnipe", "Dernière modification"),
-        (f"{B}modstats [@user]", "Classement des modérateurs"),
-        (f"{B}absence [raison]", "Déclarer une absence"),
-        (f"{B}member", "Statistiques du serveur"),
-        (f"{B}vc", "Statistiques vocales"),
-        (f"{B}notes <@user>", "Notes internes sur un membre"),
-    ]),
-    "Sanctions & Logs": ("\U0001f4dc", E, [
-        (f"{E}sanction <@user|ID>", "Historique des sanctions"),
-        (f"{E}mutelist", "Liste des membres mute/bannis"),
-        (f"{E}delsanction <ID>", "Supprime une sanction"),
-        (f"{E}delallsanction <@user>", "Efface tout l'historique"),
-        (f"{E}note <@user> <texte>", "Ajoute une note interne"),
-        (f"{E}delnote <ID>", "Supprime une note"),
-        (f"{E}auditlog [n]", "Journal d'audit du serveur"),
-        (f"{E}clearwarns <@user>", "Efface les dossiers d'un membre"),
-    ]),
-    "Blacklist / Hardban (Owner)": ("\U0001f6ab", E, [
-        (f"{E}bl <@user|ID> [raison]", "Ban anti-retour + anti-alt"),
-        (f"{E}unbl <ID>", "Lève le ban"),
-        (f"{E}bls", "Liste des bannis"),
-        (f"{E}hbconfig", "Réglages anti-alt"),
-        (f"{E}botbl <@user>", "Bloque juste l'usage du bot (léger)"),
-        (f"{E}whitelist add <@role>", "Rôle exempté de l'automod"),
-    ]),
-    "Rôles & Salons (Owner)": ("\u2699\ufe0f", E, [
-        (f"{E}createrole <nom> [#couleur]", "Crée un rôle"),
-        (f"{E}deleterole <@role>", "Supprime un rôle"),
-        (f"{E}rolecolor <@role> <#hex>", "Change la couleur d'un rôle"),
-        (f"{E}rolename <@role> <nom>", "Renomme un rôle"),
-        (f"{E}roleall <@role>", "Donne un rôle à tout le monde"),
-        (f"{E}temprole <@user> <@role> <durée>", "Rôle temporaire"),
-        (f"{E}createchannel <nom>", "Crée un salon"),
-        (f"{E}deletechannel [salon]", "Supprime un salon"),
-        (f"{E}hidechannel / {E}showchannel", "Masque / réaffiche un salon"),
-        (f"{E}nuke", "Recrée le salon (efface tout)"),
-        (f'{E}addrolecS "nom" [emoji]', "Ajoute un rôle au menu de choix"),
-        (f"{E}rolepanel [#salon]", "Publie le menu « choisis ton rôle »"),
-    ]),
-    "Vocal": ("\U0001f39b\ufe0f", B, [
-        (f"{B}vckick <@user>", "Déconnecte du vocal"),
-        (f"{B}vcmove <@user> <salon>", "Déplace en vocal"),
-        (f"{B}summon <@user>", "Amène un membre dans ton salon"),
-        (f"{B}followme <@role>", "Rassemble un rôle chez toi"),
-        (f"{B}vclock / {B}vcunlock", "Verrouille un salon vocal"),
-        (f"{B}muteall / {B}unmuteall", "Coupe le micro de tout le vocal"),
-        (f"{B}voice setup", "Salons « créer votre salon »"),
-    ]),
-    "Tickets & Bienvenue": ("\U0001f3ab", E, [
-        (f"{E}ticket panel", "Publie le panneau de tickets"),
-        (f"{E}ticket staff <@role>", "Rôle du staff des tickets"),
-        (f"{E}welcome channel <#salon>", "Salon de bienvenue"),
-        (f"{E}welcome autorole <@role>", "Rôle automatique à l'arrivée"),
-        (f"{E}goodbye channel <#salon>", "Salon des départs"),
-    ]),
-    "Sécurité (Owner)": ("\U0001f6e1\ufe0f", E, [
-        (f"{E}antiraid on / off", "Active la protection anti-raid"),
-        (f"{E}antiraid set <clé> <valeur>", "Règle les seuils"),
-        (f"{E}antiraid panic [min]", "Verrouillage d'urgence"),
-        (f"{E}hardban <@user|ID> [raison]", "Ban anti-retour + anti-alt"),
-        (f"{E}unhardban <ID>", "Lève un hardban"),
-        (f"{E}hardbans", "Liste des hardbans"),
-        (f"{E}massban <ID...> [raison]", "Bannit plusieurs IDs"),
-        (f"{E}lockdown on / off", "Verrouille tout le serveur"),
-        (f"{E}verifylevel <niveau>", "Niveau de vérification"),
-    ]),
-    "Outils & Fun": ("\U0001f9f0", B, [
-        (f"{B}tag <nom>", "Réponses personnalisées"),
-        (f"{B}giveaway start <durée> <n> <lot>", "Lance un concours"),
-        (f"{B}sticky set <texte>", "Message toujours épinglé"),
-        (f"{B}remind <durée> <note>", "Rappel personnel"),
-        (f"{B}calc <expression>", "Calculatrice"),
-        (f"{B}poll <question>", "Sondage"),
-        (f"{B}8ball <question>", "Boule magique"),
-        (f"{B}claim <@user> [label]", "Pseudo consensuel (avec accord)"),
-    ]),
+# Descriptions des commandes qui n'en ont pas dans leur code.
+PANEL_DESCRIPTIONS = {
+    "tempban": "Bannit un membre pour une durée, débannissement automatique.",
+    "massban": "Bannit plusieurs membres d'un coup par leurs IDs.",
+    "masskick": "Expulse plusieurs membres d'un coup par leurs IDs.",
+    "hardban": "Ban définitif avec blocage des retours et des doubles comptes.",
+    "role": "Ajoute le rôle au membre, ou le retire s'il l'a déjà.",
+    "setrole": "Donne un rôle à un membre à partir de son nom.",
+    "temprole": "Donne un rôle pour une durée limitée.",
+    "autorole": "Rôle donné à chaque arrivée. Sans argument, le désactive.",
+    "createrole": "Crée un rôle, avec une couleur optionnelle.",
+    "rolecolor": "Change la couleur d'un rôle.",
+    "rolename": "Renomme un rôle.",
+    "addrolecs": "Ajoute un rôle au menu de choix de rôles.",
+    "delrolecs": "Retire un rôle du menu de choix de rôles.",
+    "rolepanel": "Publie le menu de choix de rôles.",
+    "createchannel": "Crée un salon écrit, dans une catégorie optionnelle.",
+    "move": "Déplace un membre en vocal.",
+    "msg": "Envoie un message privé à un membre.",
+    "rep": "Répond à un message à la place du bot.",
+    "react": "Ajoute une réaction à un message.",
+    "addemoji": "Ajoute un émoji à partir d'une image jointe.",
+    "leaderboard": "Classement des membres les plus actifs.",
+    "mock": "Alterne majuscules et minuscules dans un texte.",
+    "ban": "Bannit un membre, avec une durée optionnelle.",
+    "kick": "Expulse un membre du serveur.",
+    "mute": "Rend un membre muet pour une durée donnée.",
+    "unmute": "Retire le mute d'un membre.",
+    "jail": "Retire les rôles d'un membre et l'enferme dans le salon prison.",
+    "warn": "Ajoute un avertissement au casier d'un membre.",
+    "cases": "Affiche le casier d'un membre.",
+    "delcase": "Supprime une sanction par son numéro.",
+    "purge": "Supprime des messages du salon (ou tout le salon avec all).",
+    "purge user": "Supprime les messages d'un membre.",
+    "purge contains": "Supprime les messages contenant un mot.",
+    "purge links": "Supprime les messages contenant des liens.",
+    "purge bots": "Supprime les messages des bots.",
+    "slowmode": "Active le mode lent du salon (0 pour le couper).",
+    "lock": "Empêche d'écrire dans un salon.",
+    "unlock": "Rouvre un salon verrouillé.",
+    "setmodlog": "Définit le salon des logs de modération.",
+    "setprefix": "Change le préfixe du bot sur ce serveur.",
+    "antiraid": "Affiche l'état de la protection anti-raid.",
+    "antiraid set": "Modifie un réglage de l'anti-raid.",
+    "antiraid keys": "Liste les réglages modifiables.",
+    "antiraid on": "Active la protection anti-raid.",
+    "antiraid off": "Désactive la protection anti-raid.",
+    "antiraid status": "Affiche la configuration actuelle.",
+    "antiraid alertrole": "Rôle mentionné lors d'une alerte.",
+    "antiraid logchannel": "Salon où sont envoyées les alertes.",
+    "ticket": "Affiche la configuration des tickets.",
+    "ticket add": "Ajoute un membre au ticket.",
+    "ticket remove": "Retire un membre du ticket.",
+    "ticket limit": "Nombre de tickets ouverts maximum par membre.",
+    "ticket rename": "Renomme le ticket actuel.",
+    "ticket close": "Ferme le ticket actuel.",
+    "ticket transcriptions": "Active ou coupe les transcriptions.",
+    "ticket log": "Salon des logs de tickets.",
+    "ticket staff": "Rôle du staff qui gère les tickets.",
+    "ticket panel": "Publie le panneau d'ouverture de tickets.",
+    "ticket category": "Catégorie où sont créés les tickets.",
+    "welcome": "Affiche la configuration de bienvenue.",
+    "welcome channel": "Salon des messages de bienvenue.",
+    "welcome image": "Image du message de bienvenue.",
+    "welcome dm": "Active le message privé d'accueil.",
+    "welcome message": "Modifie le texte de bienvenue.",
+    "welcome test": "Envoie un message de bienvenue de test.",
+    "welcome placeholders": "Liste les variables utilisables.",
+    "welcome autorole": "Rôle donné automatiquement à l'arrivée.",
+    "goodbye": "Affiche la configuration des départs.",
+    "goodbye channel": "Salon des messages de départ.",
+    "goodbye image": "Image du message de départ.",
+    "goodbye message": "Modifie le texte de départ.",
+    "serverinfo": "Informations générales du serveur.",
+    "avatar": "Photo de profil d'un membre.",
+    "roleinfo": "Informations détaillées sur un rôle.",
+    "8ball": "Pose une question à la boule magique.",
+    "ship": "Compatibilité entre deux membres.",
+    "roast": "Taquine gentiment un membre.",
+    "compliment": "Complimente un membre.",
+    "coinflip": "Pile ou face.",
+    "say": "Fait parler le bot dans le salon.",
+    "ls": "Propose un pseudo à un membre, appliqué seulement s'il accepte.",
+    "voiceunmute": "Réactive le micro d'un membre en vocal.",
+    "botblacklist": "Bloque l'usage du bot pour un membre.",
+    "botblacklist list": "Liste les membres bloqués.",
+    "botblacklist add": "Bloque l'usage du bot pour un membre.",
+    "botblacklist remove": "Débloque un membre.",
+    "whitelist add": "Exempte un rôle de l'automod.",
+    "whitelist remove": "Retire l'exemption d'un rôle.",
+    "sticky set": "Définit le message toujours affiché en bas.",
+    "sticky remove": "Retire le message épinglé en bas.",
+    "tag create": "Crée une réponse personnalisée.",
+    "tag delete": "Supprime une réponse personnalisée.",
+    "tag info": "Infos sur une réponse personnalisée.",
+    "tag list": "Liste les réponses personnalisées.",
+    "giveaway": "Gestion des concours.",
+    "giveaway start": "Lance un concours.",
+    "giveaway end": "Termine un concours immédiatement.",
+    "giveaway reroll": "Tire un nouveau gagnant.",
+    "channelinfo": "Informations sur un salon.",
+    "emojiinfo": "Informations sur un émoji.",
+    "emojis": "Liste les émojis du serveur.",
+    "boosters": "Liste les boosters du serveur.",
+    "newmembers": "Derniers membres arrivés.",
+    "membercount": "Nombre de membres du serveur.",
+    "firstmessage": "Lien vers le premier message du salon.",
+    "banner": "Bannière du serveur.",
+    "servericon": "Icône du serveur.",
+    "perms": "Permissions d'un membre dans un salon.",
+    "color": "Aperçu d'une couleur hexadécimale.",
+    "calc": "Calculatrice.",
+    "base64": "Encode ou décode du texte en base64.",
+    "reverse": "Écrit un texte à l'envers.",
+    "espace": "Espace les lettres d'un texte.",
+    "uptime": "Depuis combien de temps le bot est en ligne.",
+    "remind": "Programme un rappel personnel.",
+    "roll": "Lance des dés.",
+    "choose": "Choisit au hasard parmi plusieurs options.",
+    "poll": "Crée un sondage à choix multiples.",
+    "announce": "Publie une annonce dans un salon.",
+    "embed": "Publie un embed personnalisé.",
+    "moveall": "Déplace tout un salon vocal vers un autre.",
+    "vcmove": "Déplace un membre dans un salon vocal.",
+    "vclimit": "Limite le nombre de places du salon vocal.",
+    "vcunlock": "Rouvre un salon vocal verrouillé.",
+    "unmuteall": "Réactive le micro de tout le vocal.",
+    "hardbanconfig log": "Salon des logs du hardban.",
+    "hardbanconfig autoban": "Bannit automatiquement les alts suspects.",
+    "hardbanconfig age": "Âge minimum d'un compte avant d'être suspect.",
+    "rules text": "Modifie le texte du règlement.",
+    "rules stats": "Nombre de membres ayant accepté le règlement.",
+    "rules config": "Rôle donné après acceptation du règlement.",
+    "statschannels add": "Ajoute un compteur en direct.",
+    "statschannels remove": "Retire un compteur.",
+    "statschannels setup": "Crée les compteurs par défaut.",
+    "statschannels refresh": "Met à jour les compteurs.",
+    "logs on": "Active les journaux.",
+    "logs off": "Désactive les journaux.",
+    "logs setup": "Crée les salons de journaux.",
+    "logs vocal": "Salon du journal vocal.",
+    "logs textuel": "Salon du journal des messages.",
+    "logs arrivees": "Salon du journal des arrivées.",
+    "logs moderation": "Salon du journal de modération.",
+    "mediaonly add": "Rend un salon réservé aux images.",
+    "mediaonly remove": "Retire la restriction images.",
+    "voice": "Affiche la configuration des salons temporaires.",
+    "voice panneau": "Envoie ou non le panneau de contrôle vocal.",
+    "voice hub": "Salon vocal « créer votre salon ».",
+    "voice limite": "Limite par défaut des salons créés.",
+    "voice nom": "Modèle de nom des salons créés.",
+    "voice off": "Désactive les salons temporaires.",
+    "voice categorie": "Catégorie des salons temporaires.",
+    "rolepanel texte": "Texte du menu de rôles.",
+    "rolepanel mode": "Choix unique ou multiple.",
+    "rolepanel titre": "Titre du menu de rôles.",
+    "rolepanel placeholder": "Texte affiché dans le menu déroulant.",
+    "rolepanel refresh": "Met à jour le menu publié.",
+    "help": "Aide détaillée sur une commande ou une catégorie.",
+    "ping": "Latence du bot.",
+    "botinfo": "Informations sur le bot.",
+    "permcheck": "Vérifie les permissions du bot.",
+    "invite": "Lien d'invitation du bot.",
 }
 
+# Exemples écrits à la main.
+PANEL_EXAMPLE_OVERRIDE = {"leaderboard": "-lb voice", "delrolecs": '-delrolecs "Membre actif"'}
 
-class PanelSelect(discord.ui.Select):
-    def __init__(self):
+# Utilisation écrite à la main quand la signature automatique est peu claire.
+PANEL_USAGE_OVERRIDE = {
+    "ban": "<@membre|ID> [durée] [raison]",
+    "embed": "<#salon> Titre | Description | #couleur",
+    "poll": '"Question" option1 | option2',
+    "choose": "option1 | option2 | option3",
+    "leaderboard": "[messages|voice|commands|reactions]",
+    "antiraid set": "<clé> <valeur>",
+    "base64": "<encode|decode> <texte>",
+}
+
+# Traduction des noms de paramètres pour les signatures.
+PANEL_PARAMS = {
+    "member": "@membre", "membre": "@membre", "user": "@membre|ID",
+    "cible": "@membre|ID", "a": "@membre", "b": "@membre",
+    "user_id": "ID", "ids": "IDs", "reason": "raison", "rest": "raison",
+    "duration": "durée", "duree": "durée", "when": "durée", "what": "note",
+    "amount": "nombre", "channel": "#salon", "salon": "#salon",
+    "source": "salon source", "role": "@rôle", "nom_role": "nom du rôle",
+    "nickname": "pseudo", "prefix": "préfixe", "key": "clé", "value": "valeur",
+    "state": "on|off", "template": "modèle", "url": "lien", "image_url": "lien image",
+    "category": "catégorie", "categorie": "catégorie", "word": "mot",
+    "case_id": "n° sanction", "note_id": "n° note", "text": "texte", "query": "commande",
+    "dice": "dés", "idee": "idée", "kind": "type", "modele": "modèle",
+    "message_id": "ID message", "limite": "nombre", "field": "classement",
+    "reste": "contenu", "options": "options", "question": "question",
+}
+
+_PARAM_RE = re.compile(r"([<\[])([\wéè]+)(=[^\]>]*)?([>\]])")
+
+
+def _panel_sig(cmd) -> str:
+    override = PANEL_USAGE_OVERRIDE.get(cmd.qualified_name)
+    if override is not None:
+        return override
+    sig = cmd.signature or ""
+    return _PARAM_RE.sub(
+        lambda m: f"{m.group(1)}{PANEL_PARAMS.get(m.group(2), m.group(2))}"
+                  f"{m.group(3) or ''}{m.group(4)}",
+        sig,
+    )
+
+
+_EXAMPLE_RE = re.compile(r"^(.*?[.!?])\s+([-&+]\w.*)$")
+
+
+def _panel_text(cmd) -> tuple[str, str | None]:
+    """Renvoie (description, exemple) à partir du help de la commande."""
+    raw = (cmd.help or "").strip().splitlines()[0] if cmd.help else ""
+    desc, example = raw, None
+    if raw[:1] in ("-", "&", "+"):
+        if " — " in raw:
+            example, desc = raw.split(" — ", 1)
+        else:
+            example, desc = raw, ""
+    else:
+        m = _EXAMPLE_RE.match(raw)
+        if m:
+            desc, example = m.group(1), m.group(2)
+    # Un « exemple » qui contient <...> est une signature, pas un exemple.
+    if example and ("<" in example or "[" in example):
+        example = None
+    example = PANEL_EXAMPLE_OVERRIDE.get(cmd.qualified_name, example)
+    desc = PANEL_DESCRIPTIONS.get(cmd.qualified_name) or desc.strip() or "Aucune description."
+    desc = desc[:1].upper() + desc[1:]
+    if desc and desc[-1] not in ".!?":
+        desc += "."
+    return desc, (example.strip() if example else None)
+
+
+def _panel_prefix(cmd, cat_prefix: str) -> str:
+    return PANEL_PREFIX_OVERRIDE.get(cmd.root_parent.name if cmd.root_parent else cmd.name,
+                                     cat_prefix)
+
+
+def panel_index(bot) -> list[tuple[tuple, list]]:
+    """[(infos_catégorie, [commandes...]), ...] dans l'ordre d'affichage."""
+    root_to_cat = {}
+    order = {}
+    for cat in PANEL_CATEGORIES:
+        for i, name in enumerate(cat[4]):
+            root_to_cat[name] = cat[0]
+            order[name] = i
+    buckets = {cat[0]: [] for cat in PANEL_CATEGORIES}
+    buckets[PANEL_OTHER[0]] = []
+    for cmd in bot.walk_commands():
+        if cmd.hidden:
+            continue
+        root = cmd.root_parent or cmd
+        buckets[root_to_cat.get(root.name, PANEL_OTHER[0])].append(cmd)
+
+    def sort_key(c):
+        root = c.root_parent or c
+        return (order.get(root.name, 999), root.name,
+                0 if c.parent is None else 1, c.qualified_name)
+
+    result = []
+    for cat in list(PANEL_CATEGORIES) + [PANEL_OTHER]:
+        cmds = sorted(buckets[cat[0]], key=sort_key)
+        if cmds:
+            result.append((cat, cmds))
+    return result
+
+
+def panel_home_embed(bot, guild: discord.Guild | None) -> discord.Embed:
+    index = panel_index(bot)
+    total = sum(len(c) for _, c in index)
+    e = discord.Embed(
+        title="Panneau de commandes",
+        description=(
+            "Toutes les commandes du bot, classées par catégorie.\n"
+            "Choisis une catégorie dans le menu pour voir chaque commande "
+            "et la manière de l'utiliser.\n\n"
+            "**Préfixes**\n"
+            "`-`  commandes de base\n"
+            "`&`  commandes staff\n"
+            "`+`  candidatures\n"
+            "-# Les trois préfixes fonctionnent pour toutes les commandes.\n\n"
+            "**Lire une commande**\n"
+            "`<…>` obligatoire   `[…]` optionnel   `a|b` au choix"
+        ),
+        color=PANEL_COLOR,
+    )
+    for (key, label, _desc, prefix, *_), cmds in index:
+        e.add_field(name=label, value=f"`{len(cmds)}` commandes · `{prefix}`", inline=True)
+    # Complète la dernière ligne pour garder une grille propre.
+    while len(e.fields) % 3:
+        e.add_field(name="​", value="​", inline=True)
+    if guild and guild.icon:
+        e.set_thumbnail(url=guild.icon.url)
+    e.set_footer(text=f"{total} commandes · {len(index)} catégories")
+    return e
+
+
+def panel_category_embed(bot, key: str, page: int) -> tuple[discord.Embed, int, int]:
+    index = panel_index(bot)
+    found = next(((cat, cmds) for cat, cmds in index if cat[0] == key), None)
+    if found is None:
+        return panel_home_embed(bot, None), 0, 1
+    (k, label, desc, prefix, *_), cmds = found
+    pages = max(1, (len(cmds) + PANEL_PAGE_SIZE - 1) // PANEL_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    chunk = cmds[page * PANEL_PAGE_SIZE:(page + 1) * PANEL_PAGE_SIZE]
+
+    blocs = []
+    for cmd in chunk:
+        p = _panel_prefix(cmd, prefix)
+        texte, exemple = _panel_text(cmd)
+        sig = _panel_sig(cmd)
+        lignes = [f"**{p}{cmd.qualified_name}**", texte]
+        if sig:
+            lignes.append(f"`{p}{cmd.qualified_name} {sig}`")
+        extra = []
+        if exemple:
+            ex = exemple
+            if ex[:1] in ("-", "&", "+"):
+                ex = p + ex[1:]
+            extra.append(f"ex. {ex}")
+        if cmd.aliases:
+            extra.append("alias " + ", ".join(cmd.aliases[:5]))
+        if extra:
+            lignes.append("-# " + "  ·  ".join(extra))
+        blocs.append("\n".join(lignes))
+
+    e = discord.Embed(
+        title=label,
+        description=f"-# {desc}\n\n" + "\n\n".join(blocs),
+        color=PANEL_COLOR,
+    )
+    e.set_footer(text=f"{len(cmds)} commandes · page {page + 1}/{pages}")
+    return e, page, pages
+
+
+def panel_command_embed(bot, cmd) -> discord.Embed:
+    index = panel_index(bot)
+    cat = next((c for c, cmds in index if cmd in cmds), PANEL_OTHER)
+    p = _panel_prefix(cmd, cat[3])
+    texte, exemple = _panel_text(cmd)
+    sig = _panel_sig(cmd)
+    e = discord.Embed(title=f"{p}{cmd.qualified_name}", description=texte, color=PANEL_COLOR)
+    e.add_field(name="Utilisation",
+                value=f"`{p}{cmd.qualified_name} {sig}`".replace(" `", "`"), inline=False)
+    if exemple:
+        ex = p + exemple[1:] if exemple[:1] in ("-", "&", "+") else exemple
+        e.add_field(name="Exemple", value=f"`{ex}`", inline=False)
+    if cmd.aliases:
+        e.add_field(name="Alias", value="  ".join(f"`{a}`" for a in cmd.aliases), inline=False)
+    if isinstance(cmd, commands.Group) and cmd.commands:
+        subs = sorted(cmd.commands, key=lambda c: c.name)
+        e.add_field(
+            name="Sous-commandes",
+            value="\n".join(
+                f"`{p}{c.qualified_name} {_panel_sig(c)}`".replace(" `", "`")
+                for c in subs
+            )[:1024],
+            inline=False,
+        )
+    e.set_footer(text=f"Catégorie · {cat[1]}")
+    return e
+
+
+def panel_find(bot, query: str):
+    q = query.strip().lstrip("-&+").lower()
+    if not q:
+        return None, []
+    cmd = bot.get_command(q)
+    if cmd:
+        return cmd, []
+    import difflib
+    noms = sorted({c.qualified_name for c in bot.walk_commands() if not c.hidden}
+                  | {a for c in bot.walk_commands() for a in c.aliases})
+    return None, difflib.get_close_matches(q, noms, n=5, cutoff=0.5)
+
+
+# ------------------------------------------------------------ recherche
+
+class PanelSearchModal(discord.ui.Modal, title="Rechercher une commande"):
+    requete = discord.ui.TextInput(
+        label="Nom de la commande",
+        placeholder="ex. ban, ticket panel, cand",
+        max_length=60,
+    )
+
+    def __init__(self, bot):
+        super().__init__(custom_id="panel:search_modal")
+        self.bot = bot
+
+    async def on_submit(self, interaction: discord.Interaction):
+        cmd, proches = panel_find(self.bot, str(self.requete))
+        if cmd:
+            return await interaction.response.send_message(
+                embed=panel_command_embed(self.bot, cmd), ephemeral=True
+            )
+        texte = f"Aucune commande nommée `{h.clean(str(self.requete), 50)}`."
+        if proches:
+            texte += "\n\n**Tu cherchais peut-être**\n" + "  ".join(f"`{n}`" for n in proches)
+        await interaction.response.send_message(
+            embed=discord.Embed(description=texte, color=PANEL_COLOR), ephemeral=True
+        )
+
+
+# ------------------------------------------------------------ navigation (éphémère)
+
+class PanelNavSelect(discord.ui.Select):
+    def __init__(self, bot, current: str | None):
+        self.bot = bot
         options = [
-            discord.SelectOption(label=titre, emoji=data[0],
-                                 description=f"Préfixe {data[1]}", value=titre)
-            for titre, data in FICHES.items()
-        ]
-        super().__init__(placeholder="Choisis une catégorie...",
-                         options=options, custom_id="panel:select")
+            discord.SelectOption(label=cat[1], description=cat[2][:100],
+                                 value=cat[0], default=(cat[0] == current))
+            for cat, _ in panel_index(bot)
+        ][:25]
+        super().__init__(placeholder="Changer de catégorie", options=options, row=0)
 
     async def callback(self, interaction: discord.Interaction):
-        titre = self.values[0]
-        emoji, prefixe, lignes = FICHES[titre]
-        corps = "\n".join(f"`{usage}` — {desc}" for usage, desc in lignes)
-        e = h.base_embed(f"{emoji} {titre}", corps)
-        e.set_footer(
-            text=f"{prefixe}help <commande> pour plus de détails · "
-                 f"préfixe : {prefixe}"
+        key = self.values[0]
+        embed, page, pages = panel_category_embed(self.bot, key, 0)
+        await interaction.response.edit_message(
+            embed=embed, view=PanelNavView(self.bot, key, page, pages)
         )
-        await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+class PanelNavView(discord.ui.View):
+    def __init__(self, bot, key: str, page: int, pages: int):
+        super().__init__(timeout=600)
+        self.bot, self.key, self.page, self.pages = bot, key, page, pages
+        self.add_item(PanelNavSelect(bot, key))
+        self.precedent.disabled = page <= 0
+        self.suivant.disabled = page >= pages - 1
+        self.compteur.label = f"{page + 1} / {pages}"
+
+    async def _aller(self, interaction, page):
+        embed, page, pages = panel_category_embed(self.bot, self.key, page)
+        await interaction.response.edit_message(
+            embed=embed, view=PanelNavView(self.bot, self.key, page, pages)
+        )
+
+    @discord.ui.button(label="Précédent", style=discord.ButtonStyle.secondary, row=1)
+    async def precedent(self, interaction: discord.Interaction, _):
+        await self._aller(interaction, self.page - 1)
+
+    @discord.ui.button(label="1 / 1", style=discord.ButtonStyle.secondary, disabled=True, row=1)
+    async def compteur(self, interaction: discord.Interaction, _):
+        pass
+
+    @discord.ui.button(label="Suivant", style=discord.ButtonStyle.secondary, row=1)
+    async def suivant(self, interaction: discord.Interaction, _):
+        await self._aller(interaction, self.page + 1)
+
+    @discord.ui.button(label="Rechercher", style=discord.ButtonStyle.primary, row=1)
+    async def rechercher(self, interaction: discord.Interaction, _):
+        await interaction.response.send_modal(PanelSearchModal(self.bot))
+
+
+# ------------------------------------------------------------ panneau public (persistant)
+
+class PanelSelect(discord.ui.Select):
+    def __init__(self, bot=None):
+        self.bot = bot
+        if bot is not None:
+            options = [
+                discord.SelectOption(label=cat[1], description=cat[2][:100], value=cat[0])
+                for cat, _ in panel_index(bot)
+            ][:25]
+        else:
+            options = [discord.SelectOption(label=c[1], value=c[0]) for c in PANEL_CATEGORIES]
+        super().__init__(placeholder="Choisir une catégorie", options=options,
+                         custom_id="panel:select", row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        bot = interaction.client
+        key = self.values[0]
+        embed, page, pages = panel_category_embed(bot, key, 0)
+        await interaction.response.send_message(
+            embed=embed, view=PanelNavView(bot, key, page, pages), ephemeral=True
+        )
+        # Remet le menu public à zéro pour qu'on puisse rechoisir la même catégorie.
+        try:
+            await interaction.message.edit(view=PanelView(bot))
+        except discord.HTTPException:
+            pass
 
 
 class PanelView(discord.ui.View):
     def __init__(self, bot=None):
         super().__init__(timeout=None)
         self.bot = bot
-        self.add_item(PanelSelect())
+        self.add_item(PanelSelect(bot))
+
+    @discord.ui.button(label="Rechercher une commande", style=discord.ButtonStyle.secondary,
+                       custom_id="panel:search", row=1)
+    async def rechercher(self, interaction: discord.Interaction, _):
+        await interaction.response.send_modal(PanelSearchModal(interaction.client))
 
 
 class Panel(commands.Cog):
@@ -8194,29 +8632,563 @@ class Panel(commands.Cog):
         self.bot = bot
 
     @commands.command(name="panel", aliases=["panneau", "menu", "commandes", "cmds"],
-                      help="Affiche le panneau de commandes.")
+                      help="Publie le panneau de toutes les commandes.")
     @commands.guild_only()
     async def panel(self, ctx):
-        total = len([c for c in self.bot.walk_commands() if not c.hidden])
-        e = h.base_embed(
-            f"{config.EMOJI['crown']} Panneau de commandes",
-            (
-                f"**{total}+** commandes en **{len(FICHES)}** catégories.\n\n"
-                f"**Deux préfixes actifs :**\n"
-                f"`{B}` — commandes de base (clear, ping, profil...)\n"
-                f"`{E}` — commandes de rang supérieur (blacklist, sanctions...)\n\n"
-                f"*Les deux fonctionnent partout ; le préfixe indiqué est la "
-                f"convention.*\n\n"
-                f"Choisis une catégorie ci-dessous."
-            ),
+        await ctx.send(embed=panel_home_embed(self.bot, ctx.guild), view=PanelView(self.bot))
+
+
+# ==============================================================================
+#  SECTION 19B - CANDIDATURES  (+cand)
+# ==============================================================================
+
+CAND_SCHEMA = """
+CREATE TABLE IF NOT EXISTS cand_config (
+    guild_id        INTEGER PRIMARY KEY,
+    review_channel  INTEGER,
+    staff_role      INTEGER,
+    helper_role     INTEGER,
+    reviewer_role   INTEGER,
+    is_open         INTEGER DEFAULT 1,
+    cooldown_hours  INTEGER DEFAULT 48
+);
+
+CREATE TABLE IF NOT EXISTS candidatures (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id    INTEGER NOT NULL,
+    user_id     INTEGER NOT NULL,
+    kind        TEXT NOT NULL,
+    answers     TEXT,
+    status      TEXT DEFAULT 'pending',
+    reviewer_id INTEGER,
+    reason      TEXT,
+    channel_id  INTEGER,
+    message_id  INTEGER,
+    created_at  INTEGER,
+    decided_at  INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_cand_user ON candidatures(guild_id, user_id, status);
+"""
+
+CAND_COLOR = 0x2B2D31
+CAND_PENDING = 0x5865F2
+CAND_ACCEPTED = 0x3BA55C
+CAND_REFUSED = 0xD83C3E
+
+# Les deux postes proposés. 5 questions maximum par formulaire (limite Discord),
+# intitulés de 45 caractères maximum.
+CAND_POSTES = {
+    "staff": {
+        "nom": "Staff",
+        "resume": "Modération du serveur, sanctions, tickets et respect du règlement.",
+        "menu": "Modération et gestion du serveur",
+        "questions": [
+            ("Ton âge", "ex. 18", False, 3),
+            ("Tes disponibilités", "ex. tous les soirs après 18h et le week-end", False, 100),
+            ("Ton expérience en modération", "Serveurs, rôles occupés, durée…", True, 1000),
+            ("Pourquoi veux-tu rejoindre le staff ?", "Ce que tu apporterais à l'équipe.", True, 1000),
+            ("Deux membres s'insultent : que fais-tu ?", "Décris ta réaction étape par étape.", True, 1000),
+        ],
+    },
+    "helper": {
+        "nom": "Helper",
+        "resume": "Accueil des nouveaux, réponses aux questions et entraide.",
+        "menu": "Aide et accompagnement des membres",
+        "questions": [
+            ("Ton âge", "ex. 16", False, 3),
+            ("Tes disponibilités", "ex. l'après-midi en semaine", False, 100),
+            ("Dans quoi peux-tu aider ?", "Questions générales, technique, jeux, accueil…", True, 1000),
+            ("Pourquoi veux-tu devenir helper ?", "Ce qui te motive.", True, 1000),
+            ("Un nouveau est perdu : comment l'aides-tu ?", "Explique comment tu t'y prendrais.", True, 1000),
+        ],
+    },
+}
+
+
+async def cand_config(bot, guild_id: int):
+    await bot.db.conn.execute(
+        "INSERT OR IGNORE INTO cand_config (guild_id) VALUES (?)", (guild_id,)
+    )
+    await bot.db.conn.commit()
+    return await bot.db.fetchone("SELECT * FROM cand_config WHERE guild_id=?", (guild_id,))
+
+
+async def cand_set(bot, guild_id: int, key: str, value):
+    await cand_config(bot, guild_id)
+    await bot.db.execute(f"UPDATE cand_config SET {key}=? WHERE guild_id=?", (value, guild_id))
+
+
+def cand_panel_embed(guild: discord.Guild, ouvert: bool) -> discord.Embed:
+    postes = "\n\n".join(
+        f"**{p['nom']}**\n{p['resume']}" for p in CAND_POSTES.values()
+    )
+    e = discord.Embed(
+        title="Candidatures",
+        description=(
+            f"Tu veux t'investir sur **{guild.name}** ?\n"
+            f"Choisis le poste qui te correspond dans le menu ci-dessous, "
+            f"puis remplis le formulaire.\n\n"
+            f"{postes}\n\n"
+            f"**Avant de postuler**\n"
+            f"Réponds avec sérieux et honnêteté.\n"
+            f"Une seule candidature en attente à la fois.\n"
+            f"La réponse t'est envoyée en message privé.\n\n"
+            f"-# {'Candidatures ouvertes' if ouvert else 'Candidatures fermées pour le moment'}"
+        ),
+        color=CAND_COLOR,
+    )
+    if guild.icon:
+        e.set_thumbnail(url=guild.icon.url)
+    e.set_footer(text=guild.name)
+    return e
+
+
+def cand_review_embed(member, row, answers, statut: str, color: int) -> discord.Embed:
+    poste = CAND_POSTES.get(row["kind"], {"nom": row["kind"]})
+    e = discord.Embed(
+        title=f"Candidature {poste['nom']}  ·  n°{row['id']}",
+        description=(
+            f"{member.mention if member else '<@' + str(row['user_id']) + '>'}  ·  `{row['user_id']}`\n"
+            + (f"Compte créé {discord.utils.format_dt(member.created_at, 'R')}"
+               if member else "")
+            + (f"  ·  arrivé {discord.utils.format_dt(member.joined_at, 'R')}"
+               if member is not None and getattr(member, "joined_at", None) else "")
+        ),
+        color=color,
+        timestamp=datetime.datetime.fromtimestamp(row["created_at"], datetime.timezone.utc),
+    )
+    if member:
+        e.set_author(name=str(member), icon_url=member.display_avatar.url)
+        e.set_thumbnail(url=member.display_avatar.url)
+    for question, reponse in answers:
+        e.add_field(name=question, value=(reponse or "—")[:1024], inline=False)
+    e.add_field(name="Statut", value=statut, inline=False)
+    e.set_footer(text="Candidature envoyée")
+    return e
+
+
+def cand_review_view(cand_id: int) -> discord.ui.View:
+    v = discord.ui.View(timeout=None)
+    v.add_item(discord.ui.Button(label="Accepter", style=discord.ButtonStyle.success,
+                                 custom_id=f"cand:acc:{cand_id}"))
+    v.add_item(discord.ui.Button(label="Refuser", style=discord.ButtonStyle.danger,
+                                 custom_id=f"cand:ref:{cand_id}"))
+    return v
+
+
+def cand_closed_view(texte: str) -> discord.ui.View:
+    v = discord.ui.View(timeout=None)
+    v.add_item(discord.ui.Button(label=texte[:80], style=discord.ButtonStyle.secondary,
+                                 disabled=True, custom_id="cand:done"))
+    return v
+
+
+async def cand_blocage(bot, member: discord.Member, kind: str) -> str | None:
+    """Renvoie un message d'erreur si le membre ne peut pas postuler, sinon None."""
+    cfg = await cand_config(bot, member.guild.id)
+    if not cfg["is_open"]:
+        return "Les candidatures sont fermées pour le moment."
+    salon = member.guild.get_channel(cfg["review_channel"] or 0)
+    if salon is None:
+        return "Les candidatures ne sont pas encore configurées. Préviens un administrateur."
+    role_id = cfg["staff_role"] if kind == "staff" else cfg["helper_role"]
+    if role_id and any(r.id == role_id for r in member.roles):
+        return f"Tu as déjà le rôle {CAND_POSTES[kind]['nom']}."
+    en_cours = await bot.db.fetchone(
+        "SELECT id FROM candidatures WHERE guild_id=? AND user_id=? AND status='pending'",
+        (member.guild.id, member.id),
+    )
+    if en_cours:
+        return f"Tu as déjà une candidature en attente (n°{en_cours['id']}). Patiente jusqu'à la réponse."
+    dernier = await bot.db.fetchone(
+        "SELECT decided_at FROM candidatures WHERE guild_id=? AND user_id=? AND kind=?"
+        " AND status='refused' ORDER BY decided_at DESC LIMIT 1",
+        (member.guild.id, member.id, kind),
+    )
+    if dernier and dernier["decided_at"]:
+        fin = dernier["decided_at"] + (cfg["cooldown_hours"] or 0) * 3600
+        if fin > time.time():
+            return f"Tu pourras repostuler <t:{int(fin)}:R>."
+    return None
+
+
+class CandModal(discord.ui.Modal):
+    def __init__(self, bot, kind: str):
+        poste = CAND_POSTES[kind]
+        super().__init__(title=f"Candidature {poste['nom']}", timeout=900)
+        self.bot, self.kind = bot, kind
+        self.champs = []   # [(intitulé, champ)]
+        for label, placeholder, long, maxi in poste["questions"]:
+            champ = discord.ui.TextInput(
+                label=label[:45],
+                placeholder=placeholder[:100],
+                style=discord.TextStyle.paragraph if long else discord.TextStyle.short,
+                max_length=maxi,
+                min_length=1 if not long else 20,
+                required=True,
+            )
+            self.champs.append((label[:45], champ))
+            self.add_item(champ)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        member = interaction.user
+        guild = interaction.guild
+        erreur = await cand_blocage(self.bot, member, self.kind)
+        if erreur:
+            return await interaction.response.send_message(
+                embed=discord.Embed(description=erreur, color=CAND_REFUSED), ephemeral=True
+            )
+        cfg = await cand_config(self.bot, guild.id)
+        salon = guild.get_channel(cfg["review_channel"])
+        answers = [(q, str(c.value).strip()) for q, c in self.champs]
+
+        cur = await self.bot.db.conn.execute(
+            "INSERT INTO candidatures (guild_id,user_id,kind,answers,created_at) VALUES (?,?,?,?,?)",
+            (guild.id, member.id, self.kind, json.dumps(answers), int(time.time())),
         )
-        for titre, (emoji, prefixe, lignes) in FICHES.items():
-            e.add_field(name=f"{emoji} {titre}",
-                        value=f"`{prefixe}` · {len(lignes)} cmd", inline=True)
-        if ctx.guild.icon:
-            e.set_thumbnail(url=ctx.guild.icon.url)
-        e.set_footer(text=ctx.guild.name)
-        await ctx.send(embed=e, view=PanelView(self.bot))
+        await self.bot.db.conn.commit()
+        row = await self.bot.db.fetchone("SELECT * FROM candidatures WHERE id=?", (cur.lastrowid,))
+
+        role = guild.get_role(cfg["reviewer_role"] or 0)
+        try:
+            msg = await salon.send(
+                content=role.mention if role else None,
+                embed=cand_review_embed(member, row, answers, "En attente", CAND_PENDING),
+                view=cand_review_view(row["id"]),
+                allowed_mentions=discord.AllowedMentions(roles=True),
+            )
+        except discord.HTTPException:
+            await self.bot.db.execute("DELETE FROM candidatures WHERE id=?", (row["id"],))
+            return await interaction.response.send_message(
+                embed=discord.Embed(
+                    description="Impossible d'envoyer ta candidature au staff. Préviens un administrateur.",
+                    color=CAND_REFUSED),
+                ephemeral=True,
+            )
+        await self.bot.db.execute(
+            "UPDATE candidatures SET channel_id=?, message_id=? WHERE id=?",
+            (msg.channel.id, msg.id, row["id"]),
+        )
+        e = discord.Embed(
+            title="Candidature envoyée",
+            description=(
+                f"Ta candidature **{CAND_POSTES[self.kind]['nom']}** a bien été transmise "
+                f"à l'équipe.\nTu recevras la réponse en message privé, "
+                f"pense à les laisser ouverts.\n\n-# Candidature n°{row['id']}"
+            ),
+            color=CAND_ACCEPTED,
+        )
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+class CandRefusModal(discord.ui.Modal, title="Refuser la candidature"):
+    motif = discord.ui.TextInput(
+        label="Motif (envoyé au candidat)",
+        style=discord.TextStyle.paragraph,
+        placeholder="Optionnel. Laisse vide pour ne pas donner de motif.",
+        required=False,
+        max_length=500,
+    )
+
+    def __init__(self, cog, cand_id: int):
+        super().__init__(timeout=600)
+        self.cog, self.cand_id = cog, cand_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.cog.decider(interaction, self.cand_id, False, str(self.motif).strip() or None)
+
+
+class CandSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label=f"Devenir {p['nom']}", description=p["menu"][:100], value=k)
+            for k, p in CAND_POSTES.items()
+        ]
+        super().__init__(placeholder="Choisir un poste", options=options,
+                         custom_id="cand:select", min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        bot = interaction.client
+        kind = self.values[0]
+        erreur = await cand_blocage(bot, interaction.user, kind)
+        if erreur:
+            await interaction.response.send_message(
+                embed=discord.Embed(description=erreur, color=CAND_COLOR), ephemeral=True
+            )
+        else:
+            await interaction.response.send_modal(CandModal(bot, kind))
+        # Remet le menu à zéro pour pouvoir rechoisir la même option.
+        try:
+            await interaction.message.edit(view=CandPanelView())
+        except discord.HTTPException:
+            pass
+
+
+class CandPanelView(discord.ui.View):
+    def __init__(self, bot=None):
+        super().__init__(timeout=None)
+        self.add_item(CandSelect())
+
+
+class Candidatures(commands.Cog):
+    """Candidatures staff et helper."""
+
+    def __init__(self, bot):
+        self.bot = bot
+
+    async def cog_load(self):
+        await self.bot.db.conn.executescript(CAND_SCHEMA)
+        await self.bot.db.conn.commit()
+
+    # ------------------------------------------------------------ décisions
+    async def peut_decider(self, member: discord.Member) -> bool:
+        if member.id in config.OWNER_IDS or member.id == member.guild.owner_id:
+            return True
+        perms = member.guild_permissions
+        if perms.administrator or perms.manage_guild:
+            return True
+        cfg = await cand_config(self.bot, member.guild.id)
+        return bool(cfg["reviewer_role"]) and any(r.id == cfg["reviewer_role"] for r in member.roles)
+
+    @commands.Cog.listener()
+    async def on_interaction(self, interaction: discord.Interaction):
+        if interaction.type != discord.InteractionType.component:
+            return
+        cid = (interaction.data or {}).get("custom_id", "")
+        if not (cid.startswith("cand:acc:") or cid.startswith("cand:ref:")):
+            return
+        if interaction.guild is None:
+            return
+        try:
+            cand_id = int(cid.split(":")[2])
+        except (IndexError, ValueError):
+            return
+        if not await self.peut_decider(interaction.user):
+            return await interaction.response.send_message(
+                embed=discord.Embed(description="Tu n'as pas la permission de traiter les candidatures.",
+                                    color=CAND_REFUSED),
+                ephemeral=True,
+            )
+        if cid.startswith("cand:ref:"):
+            row = await self.bot.db.fetchone("SELECT status FROM candidatures WHERE id=?", (cand_id,))
+            if row and row["status"] != "pending":
+                return await interaction.response.send_message(
+                    embed=discord.Embed(description="Cette candidature a déjà été traitée.",
+                                        color=CAND_COLOR), ephemeral=True)
+            return await interaction.response.send_modal(CandRefusModal(self, cand_id))
+        await self.decider(interaction, cand_id, True, None)
+
+    async def decider(self, interaction: discord.Interaction, cand_id: int,
+                      accepte: bool, motif: str | None):
+        guild = interaction.guild
+        row = await self.bot.db.fetchone(
+            "SELECT * FROM candidatures WHERE id=? AND guild_id=?", (cand_id, guild.id)
+        )
+        if row is None or row["status"] != "pending":
+            return await interaction.response.send_message(
+                embed=discord.Embed(description="Cette candidature a déjà été traitée.", color=CAND_COLOR),
+                ephemeral=True,
+            )
+        cfg = await cand_config(self.bot, guild.id)
+        poste = CAND_POSTES.get(row["kind"], {"nom": row["kind"]})
+        member = guild.get_member(row["user_id"])
+        notes = []
+
+        if accepte:
+            role = guild.get_role((cfg["staff_role"] if row["kind"] == "staff" else cfg["helper_role"]) or 0)
+            if member is None:
+                notes.append("Le membre a quitté le serveur.")
+            elif role is None:
+                notes.append(f"Aucun rôle {poste['nom']} configuré, à donner manuellement.")
+            else:
+                try:
+                    await member.add_roles(role, reason=f"Candidature n°{cand_id} acceptée par {interaction.user}")
+                    notes.append(f"Rôle {role.mention} attribué.")
+                except discord.HTTPException:
+                    notes.append(f"Impossible de donner {role.mention} : vérifie la position de mon rôle.")
+
+        statut = "accepted" if accepte else "refused"
+        await self.bot.db.execute(
+            "UPDATE candidatures SET status=?, reviewer_id=?, reason=?, decided_at=? WHERE id=?",
+            (statut, interaction.user.id, motif, int(time.time()), cand_id),
+        )
+
+        # Message privé au candidat
+        if member is not None:
+            if accepte:
+                dm = discord.Embed(
+                    title="Candidature acceptée",
+                    description=(
+                        f"Ta candidature **{poste['nom']}** sur **{guild.name}** a été acceptée.\n"
+                        f"Bienvenue dans l'équipe."
+                    ),
+                    color=CAND_ACCEPTED,
+                )
+            else:
+                dm = discord.Embed(
+                    title="Candidature non retenue",
+                    description=(
+                        f"Ta candidature **{poste['nom']}** sur **{guild.name}** n'a pas été retenue cette fois."
+                        + (f"\n\n**Motif**\n{motif}" if motif else "")
+                        + (f"\n\n-# Tu pourras repostuler dans {cfg['cooldown_hours']} h."
+                           if cfg["cooldown_hours"] else "")
+                    ),
+                    color=CAND_REFUSED,
+                )
+            if guild.icon:
+                dm.set_thumbnail(url=guild.icon.url)
+            try:
+                await member.send(embed=dm)
+            except discord.HTTPException:
+                notes.append("Messages privés fermés, le candidat n'a pas été prévenu.")
+
+        answers = json.loads(row["answers"] or "[]")
+        ligne = f"{'Acceptée' if accepte else 'Refusée'} par {interaction.user.mention} " \
+                f"{discord.utils.format_dt(discord.utils.utcnow(), 'R')}"
+        if motif:
+            ligne += f"\nMotif : {motif}"
+        if notes:
+            ligne += "\n-# " + "\n-# ".join(notes)
+        embed = cand_review_embed(member, row, answers, ligne[:1024],
+                                  CAND_ACCEPTED if accepte else CAND_REFUSED)
+        view = cand_closed_view(f"{'Acceptée' if accepte else 'Refusée'} · {interaction.user.display_name}")
+        try:
+            await interaction.response.edit_message(content=None, embed=embed, view=view)
+        except discord.HTTPException:
+            await interaction.response.send_message("Décision enregistrée.", ephemeral=True)
+
+    # ------------------------------------------------------------ commandes
+    @commands.group(name="cand", aliases=["candidature", "candidatures", "recrutement"],
+                    invoke_without_command=True,
+                    help="Publie le panneau de candidatures (staff et helper).")
+    @commands.guild_only()
+    @is_owner_or(manage_guild=True)
+    async def cand(self, ctx, salon: discord.TextChannel = None):
+        salon = salon or ctx.channel
+        cfg = await cand_config(self.bot, ctx.guild.id)
+        infos = []
+
+        # Crée un salon privé de réception si aucun n'est configuré.
+        if ctx.guild.get_channel(cfg["review_channel"] or 0) is None:
+            overwrites = {
+                ctx.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                ctx.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                                          embed_links=True),
+            }
+            reviewer = ctx.guild.get_role(cfg["reviewer_role"] or 0)
+            if reviewer:
+                overwrites[reviewer] = discord.PermissionOverwrite(view_channel=True)
+            try:
+                recep = await ctx.guild.create_text_channel(
+                    "candidatures-staff", category=ctx.channel.category, overwrites=overwrites,
+                    reason="Réception des candidatures",
+                )
+                await cand_set(self.bot, ctx.guild.id, "review_channel", recep.id)
+                infos.append(f"Salon de réception créé : {recep.mention}")
+            except discord.HTTPException:
+                return await ctx.reply(embed=h.err_embed(
+                    f"Aucun salon de réception. Configure-le avec `{ctx.prefix}cand salon #salon`."
+                ))
+
+        await salon.send(embed=cand_panel_embed(ctx.guild, bool(cfg["is_open"])), view=CandPanelView())
+        if not cfg["staff_role"] or not cfg["helper_role"]:
+            infos.append(f"Pense à définir les rôles : `{ctx.prefix}cand role staff @rôle` "
+                         f"et `{ctx.prefix}cand role helper @rôle`")
+        if salon != ctx.channel or infos:
+            await ctx.reply(embed=h.ok_embed("Panneau publié." + ("\n" + "\n".join(infos) if infos else "")))
+
+    @cand.command(name="salon", help="Salon où arrivent les candidatures.")
+    async def cand_salon(self, ctx, salon: discord.TextChannel):
+        await cand_set(self.bot, ctx.guild.id, "review_channel", salon.id)
+        await ctx.reply(embed=h.ok_embed(f"Les candidatures arriveront dans {salon.mention}."))
+
+    @cand.command(name="role", help="Rôle donné quand une candidature est acceptée. +cand role staff @Staff")
+    async def cand_role(self, ctx, poste: str, role: discord.Role):
+        poste = poste.lower()
+        if poste not in CAND_POSTES:
+            return await ctx.reply(embed=h.err_embed("Poste inconnu : `staff` ou `helper`."))
+        await cand_set(self.bot, ctx.guild.id, f"{poste}_role", role.id)
+        await ctx.reply(embed=h.ok_embed(
+            f"Les candidats **{CAND_POSTES[poste]['nom']}** acceptés recevront {role.mention}."))
+
+    @cand.command(name="recruteur", help="Rôle qui peut traiter les candidatures (mentionné à chaque envoi).")
+    async def cand_recruteur(self, ctx, role: discord.Role = None):
+        await cand_set(self.bot, ctx.guild.id, "reviewer_role", role.id if role else None)
+        cfg = await cand_config(self.bot, ctx.guild.id)
+        recep = ctx.guild.get_channel(cfg["review_channel"] or 0)
+        if role and recep:
+            try:
+                await recep.set_permissions(role, view_channel=True)
+            except discord.HTTPException:
+                pass
+        await ctx.reply(embed=h.ok_embed(
+            f"Rôle recruteur : {role.mention}." if role else "Rôle recruteur retiré."))
+
+    @cand.command(name="ouvrir", help="Ouvre les candidatures.")
+    async def cand_ouvrir(self, ctx):
+        await cand_set(self.bot, ctx.guild.id, "is_open", 1)
+        await ctx.reply(embed=h.ok_embed("Candidatures ouvertes."))
+
+    @cand.command(name="fermer", help="Ferme les candidatures.")
+    async def cand_fermer(self, ctx):
+        await cand_set(self.bot, ctx.guild.id, "is_open", 0)
+        await ctx.reply(embed=h.ok_embed("Candidatures fermées."))
+
+    @cand.command(name="delai", help="Délai en heures avant de pouvoir repostuler après un refus.")
+    async def cand_delai(self, ctx, heures: int):
+        heures = max(0, min(heures, 24 * 60))
+        await cand_set(self.bot, ctx.guild.id, "cooldown_hours", heures)
+        await ctx.reply(embed=h.ok_embed(f"Délai après un refus : **{heures} h**."))
+
+    @cand.command(name="attente", help="Liste les candidatures en attente.")
+    async def cand_attente(self, ctx):
+        rows = await self.bot.db.fetchall(
+            "SELECT * FROM candidatures WHERE guild_id=? AND status='pending' ORDER BY id LIMIT 20",
+            (ctx.guild.id,),
+        )
+        if not rows:
+            return await ctx.reply(embed=discord.Embed(description="Aucune candidature en attente.",
+                                                       color=CAND_COLOR))
+        lignes = []
+        for r in rows:
+            lien = (f"https://discord.com/channels/{ctx.guild.id}/{r['channel_id']}/{r['message_id']}"
+                    if r["message_id"] else None)
+            nom = CAND_POSTES.get(r["kind"], {"nom": r["kind"]})["nom"]
+            lignes.append(f"`n°{r['id']}`  {nom}  ·  <@{r['user_id']}>  ·  <t:{r['created_at']}:R>"
+                          + (f"  ·  [voir]({lien})" if lien else ""))
+        await ctx.reply(embed=discord.Embed(title="Candidatures en attente",
+                                            description="\n".join(lignes), color=CAND_COLOR))
+
+    @cand.command(name="config", help="Affiche la configuration des candidatures.")
+    async def cand_conf(self, ctx):
+        cfg = await cand_config(self.bot, ctx.guild.id)
+
+        def m(obj_id, kind):
+            if not obj_id:
+                return "non défini"
+            return f"<#{obj_id}>" if kind == "c" else f"<@&{obj_id}>"
+
+        e = discord.Embed(title="Configuration des candidatures", color=CAND_COLOR)
+        e.add_field(name="État", value="Ouvertes" if cfg["is_open"] else "Fermées", inline=True)
+        e.add_field(name="Délai après refus", value=f"{cfg['cooldown_hours']} h", inline=True)
+        e.add_field(name="Réception", value=m(cfg["review_channel"], "c"), inline=True)
+        e.add_field(name="Rôle staff", value=m(cfg["staff_role"], "r"), inline=True)
+        e.add_field(name="Rôle helper", value=m(cfg["helper_role"], "r"), inline=True)
+        e.add_field(name="Recruteurs", value=m(cfg["reviewer_role"], "r"), inline=True)
+        p = ctx.prefix
+        e.add_field(
+            name="Commandes",
+            value=(f"`{p}cand [#salon]` publier le panneau\n"
+                   f"`{p}cand salon #salon` réception\n"
+                   f"`{p}cand role staff|helper @rôle`\n"
+                   f"`{p}cand recruteur @rôle`\n"
+                   f"`{p}cand ouvrir` · `{p}cand fermer`\n"
+                   f"`{p}cand delai <heures>`\n"
+                   f"`{p}cand attente`"),
+            inline=False,
+        )
+        await ctx.reply(embed=e)
 
 
 # ==============================================================================
@@ -9783,7 +10755,7 @@ class MyBot(commands.Bot):
         log.info("Database ready at %s", config.DB_PATH)
 
         for cog in (Moderation, AntiRaid, Tickets, Welcome,
-                    Stats, Fun, OpMod, Tools, VoiceStats, Extras, HardBan, Rules, StatsChannels, Logging, MediaOnly, Panel, TempVoice, SelfRoles, Scheduler, Utility):
+                    Stats, Fun, OpMod, Tools, VoiceStats, Extras, HardBan, Rules, StatsChannels, Logging, MediaOnly, Panel, Candidatures, TempVoice, SelfRoles, Scheduler, Utility):
             try:
                 await self.add_cog(cog(self))
                 log.info("Loaded %s", cog.__name__)
@@ -9797,6 +10769,7 @@ class MyBot(commands.Bot):
             self.add_view(TicketControlView(self))
             self.add_view(VoicePanelView(self))
             self.add_view(PanelView(self))
+            self.add_view(CandPanelView(self))
             self.add_view(RulesView(self))
             self.add_view(SelfRolePanelView(self))
             self.persistent_views_added = True
